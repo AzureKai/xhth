@@ -24,6 +24,7 @@ Thumbs.db
 # Codex/local agent workspace metadata
 .agents/
 .codex/
+.codex_tmp_tools/
 
 # Competition data and large local artifacts
 data/train/
