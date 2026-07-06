@@ -1,0 +1,50 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+*.env
+.env*
+
+# IDEs and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Codex/local agent workspace metadata
+.agents/
+.codex/
+.codex_tmp_tools/
+
+# Competition data and large local artifacts
+data/train/
+data/test/
+data/sample_submission.csv
+*.parquet
+
+# Generated submissions and model outputs
+submission.csv
+submissions/
+outputs/
+artifacts/
+checkpoints/
+models/
+model/
+!**/model/.gitkeep
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+tmp/
+temp/
