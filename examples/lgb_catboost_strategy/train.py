@@ -9,10 +9,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-import lightgbm as lgb
-from catboost import CatBoostRegressor, Pool
-
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a lightweight LightGBM/CatBoost baseline strategy.")
@@ -20,8 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", required=True, help="Directory where model files will be written.")
     parser.add_argument("--valid-time-fraction", type=float, default=0.2)
     parser.add_argument("--sample-frac", type=float, default=1.0, help="Row sample fraction after time split.")
-    parser.add_argument("--max-train-rows", type=int, default=500_000, help="Maximum sampled train rows; use 0 for no cap.")
-    parser.add_argument("--max-valid-rows", type=int, default=150_000, help="Maximum sampled validation rows; use 0 for no cap.")
+    parser.add_argument("--max-train-rows", type=int, default=1000_000, help="Maximum sampled train rows; use 0 for no cap.")
+    parser.add_argument("--max-valid-rows", type=int, default=300_000, help="Maximum sampled validation rows; use 0 for no cap.")
     parser.add_argument("--batch-size", type=int, default=65_536, help="Parquet streaming batch size.")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--train-lightgbm", type=int, default=1)
@@ -30,6 +26,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lgb-early-stopping", type=int, default=80)
     parser.add_argument("--catboost-iterations", type=int, default=800)
     parser.add_argument("--catboost-early-stopping", type=int, default=80)
+    parser.add_argument("--alpha-grid", default="0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.5")
+    parser.add_argument("--xs-feature-count", type=int, default=50, help="Number of features used for cross-sectional rank/demean.")
+    parser.add_argument("--xs-features", default="", help="Comma-separated explicit feature list for cross-sectional features.")
     parser.add_argument("--threads", type=int, default=4)
     return parser.parse_args()
 
@@ -191,13 +190,71 @@ def load_train_valid_frames(
     return train, valid, cutoff_time, train_probability, valid_probability
 
 
-def build_matrix(frame: pd.DataFrame, features: list[str], use_asset_id: bool = True) -> np.ndarray:
+def select_xs_features(model_dir: Path, features: list[str], count: int, explicit: str) -> list[str]:
+    if count <= 0:
+        return []
+    if explicit.strip():
+        selected = [item.strip() for item in explicit.split(",") if item.strip()]
+        missing = [feature for feature in selected if feature not in features]
+        if missing:
+            raise ValueError(f"xs-features contains unknown feature columns: {missing[:5]}")
+        return selected[:count]
+
+    importance_path = model_dir / "feature_importance.csv"
+    if importance_path.exists():
+        importance = pd.read_csv(importance_path)
+        selected = [
+            str(feature)
+            for feature in importance.get("feature", pd.Series(dtype=str)).tolist()
+            if str(feature) in features
+        ]
+        if selected:
+            return selected[:count]
+    return features[:count]
+
+
+def input_columns(features: list[str], xs_features: list[str], use_asset_id: bool = True) -> list[str]:
+    columns = list(features)
+    for feature in xs_features:
+        columns.append(f"xs_demean_{feature}")
+        columns.append(f"xs_rank_{feature}")
+    if use_asset_id:
+        columns.append("asset_id")
+    return columns
+
+
+def cross_section_matrix(frame: pd.DataFrame, xs_features: list[str]) -> np.ndarray:
+    if not xs_features:
+        return np.empty((len(frame), 0), dtype=np.float32)
+
+    values = frame.loc[:, xs_features].astype("float32")
+    means = values.groupby(frame["time_id"], sort=False).transform("mean")
+    demean = (values - means).to_numpy(dtype=np.float32, copy=True)
+    rank = values.groupby(frame["time_id"], sort=False).rank(method="average", pct=True).to_numpy(dtype=np.float32, copy=True)
+    demean = np.nan_to_num(demean, nan=0.0, posinf=0.0, neginf=0.0)
+    rank = np.nan_to_num(rank, nan=0.5, posinf=1.0, neginf=0.0)
+
+    matrix = np.empty((len(frame), len(xs_features) * 2), dtype=np.float32)
+    matrix[:, 0::2] = demean
+    matrix[:, 1::2] = rank
+    return matrix
+
+
+def build_matrix(
+    frame: pd.DataFrame,
+    features: list[str],
+    xs_features: list[str],
+    use_asset_id: bool = True,
+) -> np.ndarray:
     x = frame.loc[:, features].to_numpy(dtype=np.float32, copy=True)
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    parts = [x]
+    if xs_features:
+        parts.append(cross_section_matrix(frame, xs_features))
     if use_asset_id:
         asset = frame["asset_id"].to_numpy(dtype=np.float32, copy=False).reshape(-1, 1)
-        x = np.hstack([x, asset])
-    return x
+        parts.append(asset)
+    return np.hstack(parts)
 
 
 def weighted_zero_mean_r2(y_true: np.ndarray, y_pred: np.ndarray, weight: np.ndarray) -> float:
@@ -219,6 +276,37 @@ def weighted_l2(y_true: np.ndarray, y_pred: np.ndarray, weight: np.ndarray) -> f
     if denominator <= 0:
         return float(np.mean((y_true - y_pred) ** 2))
     return float(np.sum(weight * (y_true - y_pred) ** 2) / denominator)
+
+
+def parse_alpha_grid(raw: str) -> list[float]:
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    if not values:
+        raise ValueError("alpha-grid must contain at least one numeric value")
+    return values
+
+
+def optimize_prediction_scale(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    weight: np.ndarray,
+    alpha_grid: list[float],
+) -> tuple[float, float, float]:
+    best_alpha = float(alpha_grid[0])
+    best_l2 = weighted_l2(y_true, y_pred * best_alpha, weight)
+    best_score = weighted_zero_mean_r2(y_true, y_pred * best_alpha, weight)
+    for alpha in alpha_grid[1:]:
+        current_pred = y_pred * float(alpha)
+        current_l2 = weighted_l2(y_true, current_pred, weight)
+        current_score = weighted_zero_mean_r2(y_true, current_pred, weight)
+        if current_score > best_score:
+            best_alpha = float(alpha)
+            best_l2 = current_l2
+            best_score = current_score
+    return best_alpha, best_l2, best_score
 
 
 def prediction_clip_bounds(predictions: list[np.ndarray]) -> tuple[float, float]:
@@ -243,7 +331,9 @@ def fit_lightgbm(
     w_valid: np.ndarray,
     args: argparse.Namespace,
 ) -> tuple[Any, np.ndarray, float]:
-    
+    require_package("lightgbm")
+    import lightgbm as lgb
+
     params = {
         "objective": "regression",
         "metric": "l2",
@@ -287,7 +377,8 @@ def fit_catboost(
     w_valid: np.ndarray,
     args: argparse.Namespace,
 ) -> tuple[Any, np.ndarray, float]:
-    
+    require_package("catboost")
+    from catboost import CatBoostRegressor, Pool
 
     train_pool = Pool(x_train, label=y_train, weight=w_train)
     valid_pool = Pool(x_valid, label=y_valid, weight=w_valid)
@@ -321,6 +412,64 @@ def ensemble_weights(model_specs: list[dict[str, Any]]) -> list[float]:
     return weights.tolist()
 
 
+def lightgbm_importance(model: Any, input_columns: list[str]) -> pd.DataFrame:
+    gain = model.feature_importance(importance_type="gain").astype(np.float64)
+    split = model.feature_importance(importance_type="split").astype(np.float64)
+    return pd.DataFrame(
+        {
+            "feature": input_columns,
+            "model": "lightgbm",
+            "importance_gain": gain,
+            "importance_split": split,
+            "importance": gain,
+        }
+    )
+
+
+def catboost_importance(model: Any, input_columns: list[str]) -> pd.DataFrame:
+    importance = np.asarray(model.get_feature_importance(type="PredictionValuesChange"), dtype=np.float64)
+    return pd.DataFrame(
+        {
+            "feature": input_columns,
+            "model": "catboost",
+            "importance_gain": np.nan,
+            "importance_split": np.nan,
+            "importance": importance,
+        }
+    )
+
+
+def save_feature_importance(
+    model_dir: Path,
+    importance_frames: list[pd.DataFrame],
+    top_n: int = 50,
+) -> list[dict[str, object]]:
+    if not importance_frames:
+        return []
+
+    raw = pd.concat(importance_frames, ignore_index=True)
+    raw_path = model_dir / "feature_importance_by_model.csv"
+    raw.sort_values(["model", "importance"], ascending=[True, False]).to_csv(raw_path, index=False)
+
+    summary = (
+        raw.groupby("feature", as_index=False)
+        .agg(
+            importance_mean=("importance", "mean"),
+            importance_max=("importance", "max"),
+            importance_gain_mean=("importance_gain", "mean"),
+            importance_split_mean=("importance_split", "mean"),
+        )
+        .sort_values("importance_mean", ascending=False)
+        .reset_index(drop=True)
+    )
+    summary.insert(0, "rank", np.arange(1, len(summary) + 1))
+    summary_path = model_dir / "feature_importance.csv"
+    summary.to_csv(summary_path, index=False)
+
+    top = summary.head(top_n).copy()
+    return json.loads(top.to_json(orient="records"))
+
+
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
@@ -329,6 +478,7 @@ def main() -> None:
 
     train_files = manifest_files(data_root, "train")
     features = feature_columns(train_files)
+    xs_features = select_xs_features(model_dir, features, args.xs_feature_count, args.xs_features)
     train, valid, cutoff_time, train_probability, valid_probability = load_train_valid_frames(
         data_root=data_root,
         features=features,
@@ -340,8 +490,9 @@ def main() -> None:
         batch_size=args.batch_size,
     )
 
-    x_train = build_matrix(train, features, use_asset_id=True)
-    x_valid = build_matrix(valid, features, use_asset_id=True)
+    input_cols = input_columns(features, xs_features, use_asset_id=True)
+    x_train = build_matrix(train, features, xs_features, use_asset_id=True)
+    x_valid = build_matrix(valid, features, xs_features, use_asset_id=True)
     y_train = train["target"].to_numpy(dtype=np.float32, copy=False)
     y_valid = valid["target"].to_numpy(dtype=np.float32, copy=False)
     w_train = np.maximum(train["weight"].to_numpy(dtype=np.float32, copy=False), 0.0)
@@ -352,6 +503,7 @@ def main() -> None:
     zero_score = weighted_zero_mean_r2(y_valid, zero_pred, w_valid)
     model_specs: list[dict[str, Any]] = []
     valid_predictions: list[np.ndarray] = []
+    importance_frames: list[pd.DataFrame] = []
 
     if args.train_lightgbm:
         lgb_model, lgb_pred, lgb_score = fit_lightgbm(x_train, y_train, w_train, x_valid, y_valid, w_valid, args)
@@ -361,6 +513,7 @@ def main() -> None:
             {"type": "lightgbm", "file": lgb_file, "valid_score": lgb_score, "valid_l2": weighted_l2(y_valid, lgb_pred, w_valid)}
         )
         valid_predictions.append(lgb_pred)
+        importance_frames.append(lightgbm_importance(lgb_model, input_cols))
 
     if args.train_catboost:
         cat_model, cat_pred, cat_score = fit_catboost(x_train, y_train, w_train, x_valid, y_valid, w_valid, args)
@@ -370,6 +523,7 @@ def main() -> None:
             {"type": "catboost", "file": cat_file, "valid_score": cat_score, "valid_l2": weighted_l2(y_valid, cat_pred, w_valid)}
         )
         valid_predictions.append(cat_pred)
+        importance_frames.append(catboost_importance(cat_model, input_cols))
 
     if not model_specs:
         raise ValueError("no models were trained; enable LightGBM and/or CatBoost")
@@ -378,16 +532,25 @@ def main() -> None:
     ensemble_pred = np.zeros(len(valid), dtype=np.float64)
     for weight, pred in zip(weights, valid_predictions):
         ensemble_pred += weight * pred
-    ensemble_l2 = weighted_l2(y_valid, ensemble_pred, w_valid)
-    ensemble_score = weighted_zero_mean_r2(y_valid, ensemble_pred, w_valid)
-    clip_min, clip_max = prediction_clip_bounds([ensemble_pred])
+    ensemble_l2_raw = weighted_l2(y_valid, ensemble_pred, w_valid)
+    ensemble_score_raw = weighted_zero_mean_r2(y_valid, ensemble_pred, w_valid)
+    prediction_scale, ensemble_l2, ensemble_score = optimize_prediction_scale(
+        y_valid,
+        ensemble_pred,
+        w_valid,
+        parse_alpha_grid(args.alpha_grid),
+    )
+    scaled_ensemble_pred = ensemble_pred * prediction_scale
+    clip_min, clip_max = prediction_clip_bounds([scaled_ensemble_pred])
 
     for spec, weight in zip(model_specs, weights):
         spec["weight"] = float(weight)
+    top_feature_importance = save_feature_importance(model_dir, importance_frames)
 
     metadata = {
         "strategy": "lgb_catboost_strategy",
         "feature_columns": features,
+        "xs_feature_columns": xs_features,
         "use_asset_id": True,
         "models": model_specs,
         "valid_time_fraction": float(args.valid_time_fraction),
@@ -403,11 +566,20 @@ def main() -> None:
         "valid_rows": int(len(valid)),
         "zero_l2": zero_l2,
         "zero_score": zero_score,
+        "alpha_grid": parse_alpha_grid(args.alpha_grid),
+        "prediction_scale": prediction_scale,
+        "ensemble_l2_raw": ensemble_l2_raw,
+        "ensemble_score_raw": ensemble_score_raw,
         "ensemble_l2": ensemble_l2,
         "ensemble_score": ensemble_score,
         "clip_min": clip_min,
         "clip_max": clip_max,
-        "input_columns": [*features, "asset_id"],
+        "input_columns": input_cols,
+        "feature_importance_files": {
+            "summary": "feature_importance.csv",
+            "by_model": "feature_importance_by_model.csv",
+        },
+        "top_feature_importance": top_feature_importance,
     }
     (model_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -418,13 +590,18 @@ def main() -> None:
         "valid_cutoff_time_id": metadata["valid_cutoff_time_id"],
         "train_sample_probability": metadata["train_sample_probability"],
         "valid_sample_probability": metadata["valid_sample_probability"],
+        "xs_feature_columns": metadata["xs_feature_columns"],
         "zero_l2": metadata["zero_l2"],
         "zero_score": metadata["zero_score"],
         "models": model_specs,
+        "prediction_scale": metadata["prediction_scale"],
+        "ensemble_l2_raw": metadata["ensemble_l2_raw"],
+        "ensemble_score_raw": metadata["ensemble_score_raw"],
         "ensemble_l2": metadata["ensemble_l2"],
         "ensemble_score": metadata["ensemble_score"],
         "clip_min": metadata["clip_min"],
         "clip_max": metadata["clip_max"],
+        #"top_feature_importance": metadata["top_feature_importance"][:20],
     }
     print(json.dumps(report, indent=2))
 

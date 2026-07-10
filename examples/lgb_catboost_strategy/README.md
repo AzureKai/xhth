@@ -14,6 +14,7 @@ Default feature set:
 
 - `feature_*`
 - `asset_id`
+- selected cross-sectional `demean` / `rank` features
 
 推理阶段不会使用 `responder_*`、`target` 或 `weight`。
 
@@ -53,10 +54,18 @@ python examples/lgb_catboost_strategy/train.py --data-root data --model-dir exam
 
 默认训练会按 parquet batch 流式读取数据，并最多抽样 `500,000` 行训练集和
 `150,000` 行验证集，以避免一次性加载千万级数据导致内存溢出。
+训练结束后会在验证集上搜索 `prediction_scale`，用于收缩或放大最终预测。
+如果 `model/feature_importance.csv` 已存在，训练会默认选取其中前 `50` 个原始
+`feature_*` 生成截面 demean/rank 特征；否则使用前 `50` 个 `feature_*`。
 
 By default, training streams parquet batches and samples at most `500,000`
 training rows and `150,000` validation rows. This avoids loading tens of
 millions of rows into memory at once.
+After training, the script searches `prediction_scale` on the validation set to
+shrink or amplify final predictions.
+If `model/feature_importance.csv` already exists, training uses its top `50`
+raw `feature_*` columns for cross-sectional demean/rank features. Otherwise, it
+falls back to the first `50` `feature_*` columns.
 
 只训练 LightGBM：
 
@@ -64,6 +73,23 @@ LightGBM only:
 
 ```bash
 python examples/lgb_catboost_strategy/train.py --data-root data --model-dir examples/lgb_catboost_strategy/model --train-catboost 0
+```
+
+自定义预测缩放搜索网格：
+
+Custom prediction-scale search grid:
+
+```bash
+python examples/lgb_catboost_strategy/train.py --data-root data --model-dir examples/lgb_catboost_strategy/model --alpha-grid 0.1,0.2,0.3,0.5,0.8,1.0
+```
+
+自定义截面特征数量或显式特征列表：
+
+Custom cross-sectional feature count or explicit feature list:
+
+```bash
+python examples/lgb_catboost_strategy/train.py --data-root data --model-dir examples/lgb_catboost_strategy/model --xs-feature-count 80
+python examples/lgb_catboost_strategy/train.py --data-root data --model-dir examples/lgb_catboost_strategy/model --xs-features feature_000,feature_010,feature_123
 ```
 
 如果机器内存足够，可以关闭行数上限尝试更大规模训练：
@@ -93,12 +119,16 @@ CatBoost should remain in the final strategy package.
 
 After training, the `model/` directory contains:
 
-- `metadata.json`：特征列、模型列表、验证 L2/R2、ensemble 权重和预测 clip 范围。
+- `metadata.json`：特征列、模型列表、验证 L2/R2、ensemble 权重、预测缩放和预测 clip 范围。
+- `feature_importance.csv`：按模型平均后的特征重要性汇总。
+- `feature_importance_by_model.csv`：每个模型各自输出的特征重要性。
 - `lightgbm.txt`：LightGBM 模型文件，如果启用 LightGBM。
 - `catboost.cbm`：CatBoost 模型文件，如果启用 CatBoost。
 
 - `metadata.json`: feature columns, model list, validation L2/R2 scores,
-  ensemble weights, and prediction clip bounds.
+  ensemble weights, prediction scale, and prediction clip bounds.
+- `feature_importance.csv`: feature importance summary averaged across models.
+- `feature_importance_by_model.csv`: per-model feature importance output.
 - `lightgbm.txt`: LightGBM model file, if LightGBM is enabled.
 - `catboost.cbm`: CatBoost model file, if CatBoost is enabled.
 
@@ -107,6 +137,7 @@ After training, the `model/` directory contains:
 - 训练使用 `weight` 作为样本权重；推理阶段不会访问 `weight`。
 - 验证集默认取最后 `20%` 的 `time_id`，避免未来信息泄露。
 - 训练脚本流式读取 parquet，避免一次性加载全量训练集。
+- 截面特征只使用当前 `time_id` 的可见样本，不使用未来信息。
 - 最终推理环境较弱时，优先使用 LightGBM 单模型或小规模 ensemble。
 - `main.py` 不会读取 parquet，也不会加载训练集。
 
@@ -115,6 +146,7 @@ After training, the `model/` directory contains:
   avoid future leakage.
 - The training script streams parquet input instead of loading the full training
   set at once.
+- Cross-sectional features use only visible samples from the current `time_id`.
 - On weak final inference machines, prefer a single LightGBM model or a small
   ensemble.
 - `main.py` does not read parquet files or load the training set.
