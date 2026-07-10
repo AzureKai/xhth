@@ -211,7 +211,8 @@ def ema_matrix(frame: pd.DataFrame, ema_features: list[str], halflives: list[flo
         current = values[row_idx]
         first = ~initialized[asset_idx]
         if first.any():
-            state[asset_idx, :, first] = current[first]
+            for half_idx in range(len(halflives)):
+                state[asset_idx, half_idx, first] = current[first]
             initialized[asset_idx, first] = True
         previous = state[asset_idx].copy()
         pieces = []
