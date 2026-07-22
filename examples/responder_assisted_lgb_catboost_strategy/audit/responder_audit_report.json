@@ -1,0 +1,285 @@
+{
+  "cache_feature_count": 804,
+  "raw_feature_count": 323,
+  "temporal_feature_count": 480,
+  "time_monotonic_in_all_shards": true,
+  "valid_cutoff_time_id": 710787,
+  "responders": {
+    "responder_02": {
+      "train_rows": 100000,
+      "valid_rows": 100000,
+      "max_abs_valid_feature_corr": 0.0554884164517773,
+      "best_single_feature": {
+        "feature": "ts_minus_ema20_feature_284",
+        "train_weighted_corr": 0.0551975585057282,
+        "valid_weighted_corr": 0.0554884164517773,
+        "single_feature_valid_r2": 0.8260259148471796
+      },
+      "asset_mean_baseline_r2": 0.8118863858240621,
+      "negative_control": {
+        "available": false,
+        "reason": "lightgbm is not installed"
+      },
+      "top_features": [
+        {
+          "feature": "ts_minus_ema20_feature_284",
+          "train_weighted_corr": 0.0551975585057282,
+          "valid_weighted_corr": 0.0554884164517773,
+          "single_feature_valid_r2": 0.8260259148471796
+        },
+        {
+          "feature": "feature_284",
+          "train_weighted_corr": 0.04408078626612192,
+          "valid_weighted_corr": 0.053545183440632776,
+          "single_feature_valid_r2": 0.82599017575871
+        },
+        {
+          "feature": "feature_286",
+          "train_weighted_corr": 0.03574551265996687,
+          "valid_weighted_corr": 0.03710129718703028,
+          "single_feature_valid_r2": 0.8257405485508721
+        },
+        {
+          "feature": "feature_213",
+          "train_weighted_corr": 0.03853174837194815,
+          "valid_weighted_corr": 0.03748915529372675,
+          "single_feature_valid_r2": 0.8257392134909337
+        },
+        {
+          "feature": "feature_095",
+          "train_weighted_corr": 0.0517669886774737,
+          "valid_weighted_corr": 0.03927240027373722,
+          "single_feature_valid_r2": 0.8257378232203105
+        },
+        {
+          "feature": "ts_historical_zscore20_feature_115",
+          "train_weighted_corr": 0.023658084620765678,
+          "valid_weighted_corr": 0.04235106976424436,
+          "single_feature_valid_r2": 0.825736818807141
+        },
+        {
+          "feature": "feature_120",
+          "train_weighted_corr": -0.020206180605656147,
+          "valid_weighted_corr": -0.039377288948916296,
+          "single_feature_valid_r2": 0.8257184728262005
+        },
+        {
+          "feature": "feature_247",
+          "train_weighted_corr": -0.029659322401206424,
+          "valid_weighted_corr": -0.029222401892978776,
+          "single_feature_valid_r2": 0.825694431444433
+        },
+        {
+          "feature": "feature_036",
+          "train_weighted_corr": -0.01668660682658348,
+          "valid_weighted_corr": -0.04556206760923246,
+          "single_feature_valid_r2": 0.825686665746419
+        },
+        {
+          "feature": "feature_090",
+          "train_weighted_corr": 0.022466194935763944,
+          "valid_weighted_corr": 0.03398834607587052,
+          "single_feature_valid_r2": 0.825673957554984
+        },
+        {
+          "feature": "ts_rolling_std20_feature_023",
+          "train_weighted_corr": 0.03236308109471077,
+          "valid_weighted_corr": 0.03125960937231079,
+          "single_feature_valid_r2": 0.8256624852695951
+        },
+        {
+          "feature": "ts_rolling_std20_feature_253",
+          "train_weighted_corr": 0.03377715924556323,
+          "valid_weighted_corr": 0.029453088977098123,
+          "single_feature_valid_r2": 0.8256562965634643
+        },
+        {
+          "feature": "ts_historical_zscore20_feature_274",
+          "train_weighted_corr": 0.01754822013799911,
+          "valid_weighted_corr": 0.04232388274465141,
+          "single_feature_valid_r2": 0.8256562209200653
+        },
+        {
+          "feature": "feature_094",
+          "train_weighted_corr": -0.027926416335271792,
+          "valid_weighted_corr": -0.02593164905489654,
+          "single_feature_valid_r2": 0.8256546126462172
+        },
+        {
+          "feature": "feature_087",
+          "train_weighted_corr": 0.013018400161219346,
+          "valid_weighted_corr": 0.0070436219111584515,
+          "single_feature_valid_r2": 0.8256501425442511
+        },
+        {
+          "feature": "feature_085",
+          "train_weighted_corr": 0.007391543445157113,
+          "valid_weighted_corr": 0.006290450070430357,
+          "single_feature_valid_r2": 0.8256416146426925
+        },
+        {
+          "feature": "ts_minus_ema20_feature_274",
+          "train_weighted_corr": 0.02495275225284099,
+          "valid_weighted_corr": 0.032787838480023646,
+          "single_feature_valid_r2": 0.825637139027175
+        },
+        {
+          "feature": "ts_minus_ema20_feature_115",
+          "train_weighted_corr": 0.024952757062178414,
+          "valid_weighted_corr": 0.03278761032546963,
+          "single_feature_valid_r2": 0.8256371374121296
+        },
+        {
+          "feature": "feature_133",
+          "train_weighted_corr": 0.006716008585473209,
+          "valid_weighted_corr": 0.0023742994482072433,
+          "single_feature_valid_r2": 0.8256287754426654
+        },
+        {
+          "feature": "feature_248",
+          "train_weighted_corr": 0.02782111687213902,
+          "valid_weighted_corr": 0.028272878535335288,
+          "single_feature_valid_r2": 0.8256277993639167
+        }
+      ]
+    },
+    "responder_03": {
+      "train_rows": 100000,
+      "valid_rows": 100000,
+      "max_abs_valid_feature_corr": 0.0648222588601984,
+      "best_single_feature": {
+        "feature": "feature_120",
+        "train_weighted_corr": -0.03257581656574683,
+        "valid_weighted_corr": -0.05332249355046784,
+        "single_feature_valid_r2": 0.7907537275191846
+      },
+      "asset_mean_baseline_r2": 0.7795347031403606,
+      "negative_control": {
+        "available": false,
+        "reason": "lightgbm is not installed"
+      },
+      "top_features": [
+        {
+          "feature": "feature_120",
+          "train_weighted_corr": -0.03257581656574683,
+          "valid_weighted_corr": -0.05332249355046784,
+          "single_feature_valid_r2": 0.7907537275191846
+        },
+        {
+          "feature": "feature_036",
+          "train_weighted_corr": -0.0289179188518975,
+          "valid_weighted_corr": -0.0584229348726274,
+          "single_feature_valid_r2": 0.7906933365980344
+        },
+        {
+          "feature": "feature_313",
+          "train_weighted_corr": -0.031026348377534256,
+          "valid_weighted_corr": -0.06195479823129458,
+          "single_feature_valid_r2": 0.7906445728852202
+        },
+        {
+          "feature": "feature_000",
+          "train_weighted_corr": -0.030683991455675755,
+          "valid_weighted_corr": -0.06147406604270882,
+          "single_feature_valid_r2": 0.7906360686760778
+        },
+        {
+          "feature": "ts_minus_ema20_feature_284",
+          "train_weighted_corr": 0.029436299668806936,
+          "valid_weighted_corr": 0.04765271567502826,
+          "single_feature_valid_r2": 0.7906181796568771
+        },
+        {
+          "feature": "feature_263",
+          "train_weighted_corr": -0.02956244192338692,
+          "valid_weighted_corr": -0.06095747187335983,
+          "single_feature_valid_r2": 0.7906179404488719
+        },
+        {
+          "feature": "feature_094",
+          "train_weighted_corr": -0.03990962759723027,
+          "valid_weighted_corr": -0.040382491123754354,
+          "single_feature_valid_r2": 0.7906148375858657
+        },
+        {
+          "feature": "feature_034",
+          "train_weighted_corr": -0.018199086720074448,
+          "valid_weighted_corr": -0.0642049229657162,
+          "single_feature_valid_r2": 0.7905990232832033
+        },
+        {
+          "feature": "feature_247",
+          "train_weighted_corr": -0.03612550631112998,
+          "valid_weighted_corr": -0.038318108640559186,
+          "single_feature_valid_r2": 0.7905857107948806
+        },
+        {
+          "feature": "feature_308",
+          "train_weighted_corr": -0.024945422067322337,
+          "valid_weighted_corr": -0.05056544998239075,
+          "single_feature_valid_r2": 0.79057968051862
+        },
+        {
+          "feature": "feature_135",
+          "train_weighted_corr": -0.02184188437964764,
+          "valid_weighted_corr": -0.0523218378298883,
+          "single_feature_valid_r2": 0.7905654278378065
+        },
+        {
+          "feature": "feature_305",
+          "train_weighted_corr": -0.021483138023300635,
+          "valid_weighted_corr": -0.05097280488000335,
+          "single_feature_valid_r2": 0.7905635226751133
+        },
+        {
+          "feature": "ts_rolling_std20_feature_253",
+          "train_weighted_corr": 0.041916806415546216,
+          "valid_weighted_corr": 0.03930219639069443,
+          "single_feature_valid_r2": 0.7905540654127688
+        },
+        {
+          "feature": "ts_rolling_std20_feature_023",
+          "train_weighted_corr": 0.04286015433521175,
+          "valid_weighted_corr": 0.039628397295622377,
+          "single_feature_valid_r2": 0.7905379750445701
+        },
+        {
+          "feature": "ts_minus_ema20_feature_288",
+          "train_weighted_corr": 0.03089240500999886,
+          "valid_weighted_corr": 0.04812324558395147,
+          "single_feature_valid_r2": 0.7905359207471653
+        },
+        {
+          "feature": "feature_013",
+          "train_weighted_corr": -0.02003323461209288,
+          "valid_weighted_corr": -0.04360942725719185,
+          "single_feature_valid_r2": 0.7905334114068217
+        },
+        {
+          "feature": "feature_117",
+          "train_weighted_corr": -0.03412684009552267,
+          "valid_weighted_corr": -0.04363685394013346,
+          "single_feature_valid_r2": 0.7905131481464525
+        },
+        {
+          "feature": "feature_276",
+          "train_weighted_corr": -0.03412683588479697,
+          "valid_weighted_corr": -0.04363684630179863,
+          "single_feature_valid_r2": 0.7905131480547514
+        },
+        {
+          "feature": "feature_288",
+          "train_weighted_corr": 0.044936404138795176,
+          "valid_weighted_corr": 0.0648222588601984,
+          "single_feature_valid_r2": 0.7905119131881808
+        },
+        {
+          "feature": "feature_042",
+          "train_weighted_corr": -0.02316663053118857,
+          "valid_weighted_corr": -0.04380361572311988,
+          "single_feature_valid_r2": 0.7905055303319481
+        }
+      ]
+    }
+  }
+}

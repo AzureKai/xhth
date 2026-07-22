@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import time
@@ -10,9 +11,13 @@ from typing import Sequence as TypingSequence
 
 import numpy as np
 import lightgbm as lgb
+import pandas as pd
+
+from temporal_features import TemporalFeatureBuilder, temporal_column_names
 
 
 RESPONDERS = ["responder_03", "responder_28", "responder_29", "responder_02"]
+TEMPORAL_ENGINE_VERSION = 2
 
 
 def parse_args():
@@ -24,10 +29,27 @@ def parse_args():
     parser.add_argument("--oof-folds", type=int, default=4)
     parser.add_argument("--warmup-fraction", type=float, default=0.25)
     parser.add_argument("--shard-rows", type=int, default=250_000)
+    parser.add_argument("--temporal-feature-count", type=int, default=30)
+    parser.add_argument(
+        "--feature-importance",
+        default="",
+        help="Optional feature_importance.csv used to select temporal raw features.",
+    )
+    parser.add_argument(
+        "--temporal-plan",
+        default="",
+        help="temporal_feature_plan.json produced by analyze_feature_temporal_types.py",
+    )
     parser.add_argument("--batch-size", type=int, default=65_536)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--responder-rounds", type=int, default=500)
     parser.add_argument("--target-rounds", type=int, default=1200)
+    parser.add_argument(
+        "--ablation-mode",
+        choices=["all", "A", "B", "C", "D"],
+        default="all",
+        help="A=raw, B=raw+temporal, C=raw+responder_hat, D=all features.",
+    )
     parser.add_argument("--early-stopping", type=int, default=60)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--rebuild-cache", action="store_true")
@@ -45,6 +67,19 @@ START_TIME = time.perf_counter()
 def progress(message: str) -> None:
     elapsed = time.perf_counter() - START_TIME
     print(f"[progress {elapsed:9.1f}s] {message}", flush=True)
+
+
+def file_sha256(path: Path | None) -> str:
+    if path is None or not path.exists():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def temporal_config_hash(plan_path: Path | None, importance_path: Path | None, count: int) -> str:
+    if plan_path is not None and plan_path.exists():
+        return file_sha256(plan_path)
+    payload = f"fallback:{int(count)}:{file_sha256(importance_path)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def manifest_files(root: Path) -> list[Path]:
@@ -79,7 +114,69 @@ def iter_time_frames(files: list[Path], columns: list[str], batch_size: int):
         yield int(carry["time_id"].iloc[0]), carry.reset_index(drop=True)
 
 
-def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: int):
+def select_temporal_features(features: list[str], count: int, importance_path: Path | None):
+    if count <= 0:
+        return []
+    if importance_path is not None and importance_path.exists():
+        import pandas as pd
+
+        importance = pd.read_csv(importance_path)
+        selected = [str(value) for value in importance.get("feature", []) if str(value) in features]
+        if selected:
+            progress(f"selected temporal features from {importance_path}")
+            return selected[:count]
+    progress("feature importance unavailable; using the first raw feature columns")
+    return features[:count]
+
+
+def select_temporal_plan(features: list[str], count: int, importance_path: Path | None,
+                         plan_path: Path | None):
+    if plan_path is not None and plan_path.exists():
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        raw_recipes = payload.get("recipes", {})
+        recipes = {
+            str(feature): [str(value) for value in transforms]
+            for feature, transforms in raw_recipes.items()
+            if str(feature) in features and transforms
+        }
+        if recipes:
+            from temporal_features import TEMPORAL_SUFFIXES
+
+            for feature, transforms in recipes.items():
+                migrated = [
+                    value for value in transforms
+                    if value not in {"delta1", "xs_rank_delta1"}
+                    and value in TEMPORAL_SUFFIXES
+                ]
+                additions = []
+                if "lag5" in migrated or "ema20" in migrated:
+                    additions.extend(["lag20", "ema60"])
+                if "delta5" in migrated:
+                    additions.append("delta20")
+                if "rolling_std20" in migrated:
+                    additions.append("rolling_std60")
+                if "historical_zscore20" in migrated:
+                    additions.append("historical_zscore60")
+                if "minus_ema20" in migrated:
+                    additions.append("minus_ema60")
+                for value in additions:
+                    if value not in migrated:
+                        migrated.append(value)
+                recipes[feature] = migrated
+            progress(
+                f"loaded temporal routing plan: {plan_path}; "
+                f"features={len(recipes)}, derived={sum(map(len, recipes.values()))}"
+            )
+            return list(recipes), recipes
+    selected = select_temporal_features(features, count, importance_path)
+    from temporal_features import TEMPORAL_SUFFIXES
+
+    return selected, {feature: list(TEMPORAL_SUFFIXES) for feature in selected}
+
+
+def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: int,
+                temporal_feature_count: int, importance_path: Path | None,
+                plan_path: Path | None):
     import pyarrow.parquet as pq
 
     files = manifest_files(data_root)
@@ -92,6 +189,17 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         raise ValueError(f"missing columns: {missing}")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    temporal_features, temporal_recipes = select_temporal_plan(
+        features, temporal_feature_count, importance_path, plan_path
+    )
+    temporal_indices = [features.index(name) for name in temporal_features]
+    temporal_builder = TemporalFeatureBuilder(
+        len(temporal_features), feature_names=temporal_features, recipes=temporal_recipes
+    )
+    progress(
+        f"temporal features: {len(temporal_features)} routed raw columns, "
+        f"{sum(map(len, temporal_recipes.values()))} derived columns"
+    )
     read_columns = ["time_id", "asset_id", "weight", "target", *RESPONDERS, *features]
     buffers: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     buffered_rows = 0
@@ -123,9 +231,11 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
 
     for _, frame in iter_time_frames(files, read_columns, batch_size):
         raw = frame.loc[:, features].to_numpy(dtype=np.float32, copy=True)
+        asset_values = frame["asset_id"].to_numpy(dtype=np.int64)
+        temporal = temporal_builder.transform(asset_values, raw[:, temporal_indices])
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-        asset = frame["asset_id"].to_numpy(dtype=np.float32).reshape(-1, 1)
-        x = np.hstack([raw, asset])
+        asset = asset_values.astype(np.float32).reshape(-1, 1)
+        x = np.hstack([raw, temporal, asset])
         time_id = frame["time_id"].to_numpy(dtype=np.int64)
         target = frame["target"].to_numpy(dtype=np.float32)
         weight = np.maximum(frame["weight"].to_numpy(dtype=np.float32), 0.0)
@@ -135,7 +245,19 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         if buffered_rows >= shard_rows:
             flush()
     flush()
-    metadata = {"feature_columns": features, "responders": RESPONDERS, "shards": shards}
+    metadata = {
+        "cache_schema_version": 4,
+        "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
+        "temporal_plan_hash": temporal_config_hash(
+            plan_path, importance_path, temporal_feature_count
+        ),
+        "feature_columns": features,
+        "temporal_features": temporal_features,
+        "temporal_recipes": temporal_recipes,
+        "temporal_feature_columns": temporal_column_names(temporal_features, temporal_recipes),
+        "responders": RESPONDERS,
+        "shards": shards,
+    }
     (cache_dir / "cache.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return metadata
 
@@ -167,10 +289,12 @@ class ShardSequence(lgb.Sequence):
 
     batch_size = 8192
 
-    def __init__(self, cache_dir: Path, segments, extra: np.memmap | None = None):
+    def __init__(self, cache_dir: Path, segments, extra=None,
+                 base_indices: np.ndarray | None = None):
         self.cache_dir = cache_dir
         self.segments = list(segments)
         self.extra = extra
+        self.base_indices = base_indices
         self.lengths = [end - start for _, start, end in self.segments]
         self.offsets = np.cumsum([0, *self.lengths]).tolist()
 
@@ -193,6 +317,8 @@ class ShardSequence(lgb.Sequence):
                 ],
                 dtype=np.float64,
             )
+            if self.base_indices is not None:
+                base = base[:, self.base_indices]
             if self.extra is not None:
                 base = np.hstack(
                     [
@@ -269,8 +395,40 @@ def train_lgb_fixed(sequence, label, weight, rounds, args):
 
 def weighted_r2(y, pred, weight):
     y, pred, weight = map(lambda value: np.asarray(value, dtype=np.float64), (y, pred, weight))
+    valid = np.isfinite(y) & np.isfinite(pred) & np.isfinite(weight) & (weight > 0)
+    y, pred, weight = y[valid], pred[valid], weight[valid]
     denominator = np.sum(weight * y * y)
     return float(1.0 - np.sum(weight * (y - pred) ** 2) / denominator) if denominator > 0 else 0.0
+
+
+def target_variant_sequences(cache_dir, train_segments, valid_segments,
+                             oof_hat, valid_hat, raw_count, cached_base_count):
+    raw_indices = np.asarray([*range(raw_count), cached_base_count - 1], dtype=np.int64)
+    return {
+        "A": (
+            ShardSequence(cache_dir, train_segments, base_indices=raw_indices),
+            ShardSequence(cache_dir, valid_segments, base_indices=raw_indices),
+        ),
+        "B": (
+            ShardSequence(cache_dir, train_segments),
+            ShardSequence(cache_dir, valid_segments),
+        ),
+        "C": (
+            ShardSequence(cache_dir, train_segments, oof_hat, raw_indices),
+            ShardSequence(cache_dir, valid_segments, valid_hat, raw_indices),
+        ),
+        "D": (
+            ShardSequence(cache_dir, train_segments, oof_hat),
+            ShardSequence(cache_dir, valid_segments, valid_hat),
+        ),
+    }
+
+
+def target_variant_names(metadata, variant):
+    raw = [*metadata["feature_columns"], "asset_id"]
+    temporal = [*metadata["feature_columns"], *metadata["temporal_feature_columns"], "asset_id"]
+    responder_hat = [f"{name}_hat" for name in RESPONDERS]
+    return {"A": raw, "B": temporal, "C": [*raw, *responder_hat], "D": [*temporal, *responder_hat]}[variant]
 
 
 def main():
@@ -280,8 +438,29 @@ def main():
     model_dir.mkdir(parents=True, exist_ok=True)
     final_files = [model_dir / f"{name}.txt" for name in RESPONDERS]
     final_files.extend([model_dir / "target_lightgbm.txt", model_dir / "metadata.json"])
-    if args.skip_existing_models and all(path.exists() for path in final_files):
-        progress("all final model files already exist; training skipped")
+    existing_model_metadata = None
+    if (model_dir / "metadata.json").exists():
+        existing_model_metadata = json.loads(
+            (model_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+    requested_plan_path = Path(args.temporal_plan) if args.temporal_plan else (
+        Path(__file__).resolve().parent / "analysis" / "temporal_feature_plan.json"
+    )
+    requested_importance_path = Path(args.feature_importance) if args.feature_importance else (
+        Path(__file__).resolve().parent.parent / "lgb_catboost_strategy" / "model" / "feature_importance.csv"
+    )
+    requested_plan_hash = temporal_config_hash(
+        requested_plan_path, requested_importance_path, args.temporal_feature_count
+    )
+    model_metadata_matches = bool(
+        existing_model_metadata
+        and existing_model_metadata.get("temporal_recipes")
+        and int(existing_model_metadata.get("temporal_engine_version", 0))
+        == TEMPORAL_ENGINE_VERSION
+        and existing_model_metadata.get("temporal_plan_hash", "") == requested_plan_hash
+    )
+    if args.skip_existing_models and model_metadata_matches and all(path.exists() for path in final_files):
+        progress("all compatible final model files already exist; training skipped")
         print((model_dir / "metadata.json").read_text(encoding="utf-8"))
         return
 
@@ -292,12 +471,40 @@ def main():
     if args.rebuild_cache and cache_dir.exists():
         progress(f"removing cache: {cache_dir}")
         shutil.rmtree(cache_dir)
-    if (cache_dir / "cache.json").exists():
+        if (work_dir / "oof_models").exists():
+            progress("removing OOF models because the cache is being rebuilt")
+            shutil.rmtree(work_dir / "oof_models")
+    importance_path = Path(args.feature_importance) if args.feature_importance else (
+        Path(__file__).resolve().parent.parent / "lgb_catboost_strategy" / "model" / "feature_importance.csv"
+    )
+    plan_path = Path(args.temporal_plan) if args.temporal_plan else (
+        Path(__file__).resolve().parent / "analysis" / "temporal_feature_plan.json"
+    )
+    cache_metadata_path = cache_dir / "cache.json"
+    if cache_metadata_path.exists():
+        existing_metadata = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
+        cache_matches = (
+            int(existing_metadata.get("cache_schema_version", 0)) == 4
+            and int(existing_metadata.get("temporal_engine_version", 0))
+            == TEMPORAL_ENGINE_VERSION
+            and bool(existing_metadata.get("temporal_recipes"))
+            and existing_metadata.get("temporal_plan_hash", "")
+            == temporal_config_hash(plan_path, importance_path, args.temporal_feature_count)
+        )
+        if not cache_matches:
+            progress("existing cache has a different temporal feature schema; rebuilding it")
+            shutil.rmtree(cache_dir)
+            if (work_dir / "oof_models").exists():
+                shutil.rmtree(work_dir / "oof_models")
+    if cache_metadata_path.exists():
         progress(f"loading existing cache metadata: {cache_dir / 'cache.json'}")
-        metadata = json.loads((cache_dir / "cache.json").read_text(encoding="utf-8"))
+        metadata = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
     else:
         progress("building disk-backed training cache")
-        metadata = build_cache(data_root, cache_dir, args.shard_rows, args.batch_size)
+        metadata = build_cache(
+            data_root, cache_dir, args.shard_rows, args.batch_size,
+            args.temporal_feature_count, importance_path, plan_path,
+        )
 
     progress(f"scanning time_id from {len(metadata['shards'])} cache shards")
     times = all_times(cache_dir, metadata)
@@ -317,8 +524,38 @@ def main():
     oof_hat = np.memmap(oof_path, dtype="float32", mode="w+", shape=(oof_rows, len(RESPONDERS)))
     oof_cursor = 0
     responder_best_iterations: dict[str, list[int]] = {name: [] for name in RESPONDERS}
+    responder_diagnostics = {
+        name: {"folds": [], "oof_squared_error": 0.0, "oof_zero_denominator": 0.0}
+        for name in RESPONDERS
+    }
     oof_model_dir = work_dir / "oof_models"
+    oof_signature_payload = {
+        "feature_columns": metadata["feature_columns"],
+        "temporal_features": metadata["temporal_features"],
+        "temporal_recipes": metadata["temporal_recipes"],
+        "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
+        "temporal_plan_hash": metadata.get("temporal_plan_hash", ""),
+        "valid_cutoff": valid_cutoff,
+        "oof_folds": args.oof_folds,
+        "warmup_fraction": args.warmup_fraction,
+    }
+    oof_signature = hashlib.sha256(
+        json.dumps(oof_signature_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    oof_config_path = oof_model_dir / "config.json"
+    if oof_config_path.exists():
+        old_config = json.loads(oof_config_path.read_text(encoding="utf-8"))
+        if old_config.get("signature") != oof_signature:
+            progress("OOF model schema changed; removing incompatible OOF models")
+            shutil.rmtree(oof_model_dir)
+    elif oof_model_dir.exists() and any(oof_model_dir.glob("*.txt")):
+        progress("legacy OOF models have no schema signature; removing them")
+        shutil.rmtree(oof_model_dir)
     oof_model_dir.mkdir(parents=True, exist_ok=True)
+    oof_config_path.write_text(
+        json.dumps({"signature": oof_signature, **oof_signature_payload}, indent=2),
+        encoding="utf-8",
+    )
 
     for fold in range(args.oof_folds):
         fold_start = int(train_times[oof_boundaries[fold]])
@@ -351,6 +588,35 @@ def main():
             oof_hat[oof_cursor:oof_cursor + len(pred_x), column] = predict_sequence(
                 model, pred_x, f"OOF fold {fold + 1} {name}"
             )
+            current_hat = np.asarray(
+                oof_hat[oof_cursor:oof_cursor + len(pred_x), column],
+                dtype=np.float64,
+            )
+            current_true = np.asarray(responders_pred[:, column], dtype=np.float64)
+            current_weight = np.asarray(pred_w, dtype=np.float64)
+            fold_score = weighted_r2(current_true, current_hat, current_weight)
+            responder_diagnostics[name]["folds"].append(
+                {
+                    "fold": fold,
+                    "time_start": fold_start,
+                    "time_end": fold_end,
+                    "rows": len(pred_x),
+                    "score": fold_score,
+                }
+            )
+            diagnostic_valid = (
+                np.isfinite(current_true) & np.isfinite(current_hat)
+                & np.isfinite(current_weight) & (current_weight > 0)
+            )
+            responder_diagnostics[name]["oof_squared_error"] += float(
+                np.sum(current_weight[diagnostic_valid] * (
+                    current_true[diagnostic_valid] - current_hat[diagnostic_valid]
+                ) ** 2)
+            )
+            responder_diagnostics[name]["oof_zero_denominator"] += float(
+                np.sum(current_weight[diagnostic_valid] * current_true[diagnostic_valid] ** 2)
+            )
+            progress(f"OOF fold {fold + 1} {name}: zero-mean R2={fold_score:.8f}")
             best_iteration = int(model.best_iteration)
             if best_iteration <= 0:
                 best_iteration = int(model.current_iteration())
@@ -373,7 +639,7 @@ def main():
         final_rounds = int(np.median(responder_best_iterations[name]))
         filename = f"{name}.txt"
         model_path = model_dir / filename
-        if args.skip_existing_models and model_path.exists():
+        if args.skip_existing_models and model_metadata_matches and model_path.exists():
             progress(f"loading existing final responder model: {filename}")
             model = lgb.Booster(model_file=str(model_path))
         else:
@@ -387,38 +653,113 @@ def main():
             model.save_model(str(model_path))
             progress(f"saved final responder model: {filename}")
         valid_hat[:, column] = predict_sequence(model, valid_x, f"validation {name}")
+        valid_true = vector_for_segments(cache_dir, valid_segments, "responder", column)
+        responder_diagnostics[name]["valid_score"] = weighted_r2(
+            valid_true, valid_hat[:, column], valid_w
+        )
+        denominator = responder_diagnostics[name].pop("oof_zero_denominator")
+        squared_error = responder_diagnostics[name].pop("oof_squared_error")
+        responder_diagnostics[name]["oof_score"] = (
+            1.0 - squared_error / denominator if denominator > 0 else 0.0
+        )
+        progress(
+            f"final {name}: OOF R2={responder_diagnostics[name]['oof_score']:.8f}, "
+            f"validation R2={responder_diagnostics[name]['valid_score']:.8f}"
+        )
         responder_files[name] = filename
 
-    target_train_x = ShardSequence(cache_dir, oof_segments, oof_hat)
-    target_valid_x = ShardSequence(cache_dir, valid_segments, valid_hat)
     y_train = vector_for_segments(cache_dir, oof_segments, "target")
     w_train = vector_for_segments(cache_dir, oof_segments, "weight")
     y_valid = vector_for_segments(cache_dir, valid_segments, "target")
-    target_path = model_dir / "target_lightgbm.txt"
-    if args.skip_existing_models and target_path.exists():
-        progress("loading existing target model: target_lightgbm.txt")
-        target_model = lgb.Booster(model_file=str(target_path))
-    else:
-        progress(
-            f"training target model: train_rows={len(target_train_x):,}, "
-            f"valid_rows={len(target_valid_x):,}"
+    cached_base_count = len(metadata["feature_columns"]) + len(metadata["temporal_feature_columns"]) + 1
+    variant_sequences = target_variant_sequences(
+        cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
+        len(metadata["feature_columns"]), cached_base_count,
+    )
+    variants = ["A", "B", "C", "D"] if args.ablation_mode == "all" else [args.ablation_mode]
+    ablation_scores = {}
+    importance_frames = []
+    target_models = {}
+    valid_predictions = {}
+    for variant in variants:
+        target_train_x, target_valid_x = variant_sequences[variant]
+        variant_path = model_dir / f"target_{variant}.txt"
+        if args.skip_existing_models and model_metadata_matches and variant_path.exists():
+            progress(f"loading existing target ablation model: {variant_path.name}")
+            target_model = lgb.Booster(model_file=str(variant_path))
+        else:
+            progress(
+                f"training target variant {variant}: features={target_train_x[0].shape[0]}, "
+                f"train_rows={len(target_train_x):,}, valid_rows={len(target_valid_x):,}"
+            )
+            target_model = train_lgb(
+                target_train_x, y_train, w_train, target_valid_x,
+                y_valid, valid_w, args.target_rounds, args,
+            )
+            target_model.save_model(str(variant_path))
+        prediction = predict_sequence(target_model, target_valid_x, f"target {variant} validation")
+        score = weighted_r2(y_valid, prediction, valid_w)
+        best_iteration = int(target_model.best_iteration)
+        if best_iteration <= 0:
+            best_iteration = int(target_model.current_iteration())
+        ablation_scores[variant] = {
+            "score": score,
+            "features": target_model.num_feature(),
+            "best_iteration": best_iteration,
+            "file": variant_path.name,
+        }
+        names = target_variant_names(metadata, variant)
+        importance_frames.append(
+            pd.DataFrame(
+                {
+                    "variant": variant,
+                    "feature": names,
+                    "importance_gain": target_model.feature_importance(importance_type="gain"),
+                    "importance_split": target_model.feature_importance(importance_type="split"),
+                }
+            )
         )
-        target_model = train_lgb(target_train_x, y_train, w_train, target_valid_x,
-                                 y_valid, valid_w, args.target_rounds, args)
-        target_model.save_model(str(target_path))
-        progress("saved target model: target_lightgbm.txt")
-    valid_pred = predict_sequence(target_model, target_valid_x, "target validation")
+        target_models[variant] = target_model
+        valid_predictions[variant] = prediction
+        progress(f"target variant {variant}: zero-mean R2={score:.8f}")
+
+    best_variant = max(ablation_scores, key=lambda name: ablation_scores[name]["score"])
+    target_model = target_models[best_variant]
+    valid_pred = valid_predictions[best_variant]
+    target_path = model_dir / "target_lightgbm.txt"
+    target_model.save_model(str(target_path))
+    pd.concat(importance_frames, ignore_index=True).to_csv(
+        model_dir / "target_feature_importance.csv", index=False
+    )
+    (model_dir / "ablation_report.json").write_text(
+        json.dumps(
+            {"best_variant": best_variant, "scores": ablation_scores,
+             "responder_diagnostics": responder_diagnostics},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     clip_min, clip_max = np.quantile(valid_pred[np.isfinite(valid_pred)], [0.001, 0.999])
     output = {
         "strategy": "responder_assisted_lgb_catboost_strategy",
         "feature_columns": metadata["feature_columns"], "responders": RESPONDERS,
+        "temporal_features": metadata["temporal_features"],
+        "temporal_recipes": metadata["temporal_recipes"],
+        "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
+        "temporal_feature_columns": metadata["temporal_feature_columns"],
+        "temporal_plan_hash": metadata.get("temporal_plan_hash", ""),
         "responder_models": responder_files, "target_model": "target_lightgbm.txt",
+        "target_variant": best_variant,
+        "ablation_scores": ablation_scores,
+        "responder_diagnostics": responder_diagnostics,
+        "target_feature_importance": "target_feature_importance.csv",
+        "ablation_report": "ablation_report.json",
         "valid_cutoff_time_id": valid_cutoff, "oof_folds": args.oof_folds,
         "warmup_fraction": args.warmup_fraction, "target_train_rows": len(target_train_x),
         "responder_best_iterations": {
             name: int(np.median(values)) for name, values in responder_best_iterations.items()
         },
-        "valid_rows": len(target_valid_x), "valid_score": weighted_r2(y_valid, valid_pred, valid_w),
+        "valid_rows": len(valid_x), "valid_score": weighted_r2(y_valid, valid_pred, valid_w),
         "prediction_scale": 1.0, "clip_min": float(clip_min), "clip_max": float(clip_max),
     }
     (model_dir / "metadata.json").write_text(json.dumps(output, indent=2), encoding="utf-8")

@@ -53,6 +53,26 @@ python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py -
 responder_03, responder_28, responder_29, responder_02
 ```
 
+模型输入还会从重要性最高的 30 个原始 feature 生成 330 个时序特征，每个原始
+feature 对应：`lag1`、`lag5`、`delta1`、`delta5`、历史 `EMA5`、历史 `EMA20`、
+相对 EMA20 偏离、历史 20 期标准差、历史 z-score、当前截面 rank 和截面 rank
+相对上一期的变化。所有历史统计都只使用当前 `time_id` 之前的数据。
+
+根据首次消融的重要性结果，当前路由会移除 `delta1` 和 `xs_rank_delta1`，并在已有
+中期类型上自动增加 `lag20`、`delta20`、`EMA60`、相对 EMA60 偏离、60期滚动
+标准差和60期历史 z-score。`lag1` 与 `EMA5` 仍有一定 gain，因此暂时保留。
+
+推荐先运行无监督时序类型分析，让每个 feature 只生成适合自己的派生特征：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/analyze_feature_temporal_types.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
+```
+
+该脚本输出 `feature_temporal_statistics.csv`、`feature_temporal_routes.csv` 和
+`temporal_feature_plan.json`。训练脚本默认读取 `analysis/temporal_feature_plan.json`；
+也可以使用 `--temporal-plan` 指定其他计划。计划不存在时才回退到前 30 个 feature
+统一生成 11 种特征。
+
 训练链路：
 
 1. 按完整 `time_id` 流式读取 Parquet，避免截断资产截面；
@@ -83,6 +103,27 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 中的最终模型，仅训练缺失文件。如果五个最终模型和 `metadata.json` 全部存在，程序
 会在启动时直接输出已有 metadata 并结束。训练过程中会输出缓存分片、OOF 折、
 各 responder、分批预测和 target 模型的进度。
+
+默认 `--ablation-mode all` 会训练并比较四个 target 模型：
+
+- A：原始 feature + asset_id；
+- B：A + 路由时序特征；
+- C：A + responder_hat；
+- D：A + 路由时序特征 + responder_hat。
+
+验证分数最高的变体会保存为正式 `target_lightgbm.txt`。详细结果写入
+`model/ablation_report.json`，逐模型 gain/split importance 写入
+`model/target_feature_importance.csv`。也可通过 `--ablation-mode A` 等只训练指定变体。
+
+审计高 R² responder：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/audit_responders.py --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --output-dir examples/responder_assisted_lgb_catboost_strategy/audit
+```
+
+该脚本检查缓存维度和时间顺序，计算每个输入与 `responder_02/03` 的训练/验证加权
+相关性、单特征线性样本外 R²、asset 固定均值基线，并在 LightGBM 可用时执行标签
+打乱负对照。详细特征结果和 JSON 报告写入 `audit/`。
 
 本地顺序推理验证：
 
