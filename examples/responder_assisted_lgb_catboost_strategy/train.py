@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import shutil
@@ -41,6 +42,15 @@ def parse_args():
         help="temporal_feature_plan.json produced by analyze_feature_temporal_types.py",
     )
     parser.add_argument("--batch-size", type=int, default=65_536)
+    parser.add_argument(
+        "--training-data-mode",
+        choices=["out-of-core", "in-memory"],
+        default="out-of-core",
+        help=(
+            "out-of-core streams cached shards through lightgbm.Sequence; "
+            "in-memory concatenates each train/validation split before fitting."
+        ),
+    )
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--responder-rounds", type=int, default=500)
     parser.add_argument("--target-rounds", type=int, default=1200)
@@ -345,6 +355,37 @@ class ShardSequence(lgb.Sequence):
         return self._rows(value, value + 1)[0]
 
 
+def matrix_for_segments(cache_dir: Path, segments, extra=None,
+                        base_indices: np.ndarray | None = None) -> np.ndarray:
+    """Materialize one split as a contiguous float32 matrix."""
+    parts = []
+    cursor = 0
+    for shard_id, start, end in segments:
+        base = np.asarray(load_array(cache_dir, shard_id, "x")[start:end], dtype=np.float32)
+        if base_indices is not None:
+            base = base[:, base_indices]
+        if extra is not None:
+            count = end - start
+            base = np.hstack((base, np.asarray(extra[cursor:cursor + count], dtype=np.float32)))
+            cursor += count
+        parts.append(base)
+    if not parts:
+        raise ValueError("cannot materialize an empty set of cache segments")
+    return np.ascontiguousarray(parts[0] if len(parts) == 1 else np.vstack(parts))
+
+
+def training_matrix(args, cache_dir: Path, segments, extra=None,
+                    base_indices: np.ndarray | None = None):
+    if args.training_data_mode == "in-memory":
+        matrix = matrix_for_segments(cache_dir, segments, extra, base_indices)
+        progress(
+            f"materialized matrix: rows={matrix.shape[0]:,}, features={matrix.shape[1]:,}, "
+            f"memory={matrix.nbytes / 1024 ** 3:.2f} GiB"
+        )
+        return matrix
+    return ShardSequence(cache_dir, segments, extra, base_indices)
+
+
 def vector_for_segments(cache_dir: Path, segments, suffix: str, column: int | None = None):
     parts = []
     for shard_id, start, end in segments:
@@ -353,12 +394,13 @@ def vector_for_segments(cache_dir: Path, segments, suffix: str, column: int | No
     return np.concatenate(parts)
 
 
-def predict_sequence(model, sequence: ShardSequence, label: str = "prediction") -> np.ndarray:
+def predict_sequence(model, sequence, label: str = "prediction") -> np.ndarray:
     output = np.empty(len(sequence), dtype=np.float32)
-    total_batches = max(1, (len(sequence) + sequence.batch_size - 1) // sequence.batch_size)
+    batch_size = getattr(sequence, "batch_size", 65_536)
+    total_batches = max(1, (len(sequence) + batch_size - 1) // batch_size)
     report_every = max(1, total_batches // 20)
-    for batch_index, start in enumerate(range(0, len(sequence), sequence.batch_size), start=1):
-        stop = min(start + sequence.batch_size, len(sequence))
+    for batch_index, start in enumerate(range(0, len(sequence), batch_size), start=1):
+        stop = min(start + batch_size, len(sequence))
         output[start:stop] = model.predict(sequence[start:stop])
         if batch_index == 1 or batch_index == total_batches or batch_index % report_every == 0:
             progress(
@@ -401,27 +443,30 @@ def weighted_r2(y, pred, weight):
     return float(1.0 - np.sum(weight * (y - pred) ** 2) / denominator) if denominator > 0 else 0.0
 
 
-def target_variant_sequences(cache_dir, train_segments, valid_segments,
-                             oof_hat, valid_hat, raw_count, cached_base_count):
+def target_variant_sequences(args, cache_dir, train_segments, valid_segments,
+                             oof_hat, valid_hat, raw_count, cached_base_count,
+                             variant):
     raw_indices = np.asarray([*range(raw_count), cached_base_count - 1], dtype=np.int64)
-    return {
+    specs = {
         "A": (
-            ShardSequence(cache_dir, train_segments, base_indices=raw_indices),
-            ShardSequence(cache_dir, valid_segments, base_indices=raw_indices),
+            None, raw_indices,
         ),
         "B": (
-            ShardSequence(cache_dir, train_segments),
-            ShardSequence(cache_dir, valid_segments),
+            None, None,
         ),
         "C": (
-            ShardSequence(cache_dir, train_segments, oof_hat, raw_indices),
-            ShardSequence(cache_dir, valid_segments, valid_hat, raw_indices),
+            (oof_hat, valid_hat), raw_indices,
         ),
         "D": (
-            ShardSequence(cache_dir, train_segments, oof_hat),
-            ShardSequence(cache_dir, valid_segments, valid_hat),
+            (oof_hat, valid_hat), None,
         ),
     }
+    extras, indices = specs[variant]
+    train_extra, valid_extra = (None, None) if extras is None else extras
+    return (
+        training_matrix(args, cache_dir, train_segments, train_extra, indices),
+        training_matrix(args, cache_dir, valid_segments, valid_extra, indices),
+    )
 
 
 def target_variant_names(metadata, variant):
@@ -466,6 +511,7 @@ def main():
 
     progress(
         f"starting training: responders={RESPONDERS}, "
+        f"training_data_mode={args.training_data_mode}, "
         f"skip_existing_models={args.skip_existing_models}"
     )
     if args.rebuild_cache and cache_dir.exists():
@@ -562,7 +608,8 @@ def main():
         fold_end = valid_cutoff if fold == args.oof_folds - 1 else int(train_times[oof_boundaries[fold + 1]])
         fit_segments = segments_for_range(cache_dir, metadata, None, fold_start)
         pred_segments = segments_for_range(cache_dir, metadata, fold_start, fold_end)
-        fit_x, pred_x = ShardSequence(cache_dir, fit_segments), ShardSequence(cache_dir, pred_segments)
+        fit_x = training_matrix(args, cache_dir, fit_segments)
+        pred_x = training_matrix(args, cache_dir, pred_segments)
         fit_w = vector_for_segments(cache_dir, fit_segments, "weight")
         pred_w = vector_for_segments(cache_dir, pred_segments, "weight")
         responders_fit = vector_for_segments(cache_dir, fit_segments, "responder")
@@ -625,11 +672,15 @@ def main():
             responder_best_iterations[name].append(best_iteration)
         oof_cursor += len(pred_x)
         oof_hat.flush()
+        if args.training_data_mode == "in-memory":
+            del fit_x, pred_x
+            gc.collect()
         progress(f"OOF fold {fold + 1}/{args.oof_folds} complete")
 
     valid_segments = segments_for_range(cache_dir, metadata, valid_cutoff, None)
     train_segments = segments_for_range(cache_dir, metadata, None, valid_cutoff)
-    train_x, valid_x = ShardSequence(cache_dir, train_segments), ShardSequence(cache_dir, valid_segments)
+    train_x = training_matrix(args, cache_dir, train_segments)
+    valid_x = training_matrix(args, cache_dir, valid_segments)
     train_w = vector_for_segments(cache_dir, train_segments, "weight")
     valid_w = vector_for_segments(cache_dir, valid_segments, "weight")
     train_responders = vector_for_segments(cache_dir, train_segments, "responder")
@@ -668,21 +719,24 @@ def main():
         )
         responder_files[name] = filename
 
+    if args.training_data_mode == "in-memory":
+        del train_x, valid_x, train_responders
+        gc.collect()
+
     y_train = vector_for_segments(cache_dir, oof_segments, "target")
     w_train = vector_for_segments(cache_dir, oof_segments, "weight")
     y_valid = vector_for_segments(cache_dir, valid_segments, "target")
     cached_base_count = len(metadata["feature_columns"]) + len(metadata["temporal_feature_columns"]) + 1
-    variant_sequences = target_variant_sequences(
-        cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
-        len(metadata["feature_columns"]), cached_base_count,
-    )
     variants = ["A", "B", "C", "D"] if args.ablation_mode == "all" else [args.ablation_mode]
     ablation_scores = {}
     importance_frames = []
     target_models = {}
     valid_predictions = {}
     for variant in variants:
-        target_train_x, target_valid_x = variant_sequences[variant]
+        target_train_x, target_valid_x = target_variant_sequences(
+            args, cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
+            len(metadata["feature_columns"]), cached_base_count, variant,
+        )
         variant_path = model_dir / f"target_{variant}.txt"
         if args.skip_existing_models and model_metadata_matches and variant_path.exists():
             progress(f"loading existing target ablation model: {variant_path.name}")
@@ -722,6 +776,9 @@ def main():
         target_models[variant] = target_model
         valid_predictions[variant] = prediction
         progress(f"target variant {variant}: zero-mean R2={score:.8f}")
+        if args.training_data_mode == "in-memory":
+            del target_train_x, target_valid_x
+            gc.collect()
 
     best_variant = max(ablation_scores, key=lambda name: ablation_scores[name]["score"])
     target_model = target_models[best_variant]
@@ -755,11 +812,11 @@ def main():
         "target_feature_importance": "target_feature_importance.csv",
         "ablation_report": "ablation_report.json",
         "valid_cutoff_time_id": valid_cutoff, "oof_folds": args.oof_folds,
-        "warmup_fraction": args.warmup_fraction, "target_train_rows": len(target_train_x),
+        "warmup_fraction": args.warmup_fraction, "target_train_rows": len(y_train),
         "responder_best_iterations": {
             name: int(np.median(values)) for name, values in responder_best_iterations.items()
         },
-        "valid_rows": len(valid_x), "valid_score": weighted_r2(y_valid, valid_pred, valid_w),
+        "valid_rows": len(y_valid), "valid_score": weighted_r2(y_valid, valid_pred, valid_w),
         "prediction_scale": 1.0, "clip_min": float(clip_min), "clip_max": float(clip_max),
     }
     (model_dir / "metadata.json").write_text(json.dumps(output, indent=2), encoding="utf-8")

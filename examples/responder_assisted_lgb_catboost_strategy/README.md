@@ -1,5 +1,20 @@
 # Responder-assisted LightGBM/CatBoost Strategy
 
+## Training data modes
+
+The trainer supports two data-loading backends:
+
+- `--training-data-mode out-of-core` (default): read cached shards through `lightgbm.Sequence`.
+- `--training-data-mode in-memory`: concatenate the current training and validation ranges into contiguous `float32` matrices before fitting.
+
+Use the in-memory backend when the machine has enough RAM:
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory
+```
+
+Both modes use identical time splits and features. OOF responder folds remain time-separated to prevent leakage. The in-memory mode reports each matrix's row count, feature count, and size; reserve additional RAM for labels, weights, LightGBM bins, and training workspace.
+
 这个目录用于逐步实现利用 `responder_*` 辅助训练的 LightGBM/CatBoost 策略。
 
 当前第一阶段只分析 responder 与最终 `target` 的关系，不会训练模型，也不会把真实
