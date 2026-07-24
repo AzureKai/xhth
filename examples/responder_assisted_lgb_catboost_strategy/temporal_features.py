@@ -23,6 +23,14 @@ TEMPORAL_SUFFIXES = [
     "xs_rank_delta1",
 ]
 
+# Default cache routes exclude the two short-horizon transforms that were
+# consistently unimportant. Keep TEMPORAL_SUFFIXES complete so old metadata
+# and explicitly routed plans remain readable.
+DEFAULT_TEMPORAL_SUFFIXES = [
+    value for value in TEMPORAL_SUFFIXES
+    if value not in {"delta1", "xs_rank_delta1"}
+]
+
 
 def temporal_column_names(features: list[str], recipes: dict[str, list[str]] | None = None) -> list[str]:
     return [

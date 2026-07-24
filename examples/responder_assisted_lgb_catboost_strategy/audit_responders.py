@@ -191,6 +191,31 @@ def main():
     names = feature_names(metadata)
     if len(names) != load_array(cache_dir, 0, "x").shape[1]:
         raise ValueError("cache feature names do not match matrix width")
+    compatibility_checks = {
+        "temporal_engine_version": (
+            metadata.get("temporal_engine_version")
+            == model_metadata.get("temporal_engine_version")
+        ),
+        "temporal_plan_hash": (
+            metadata.get("temporal_plan_hash", "")
+            == model_metadata.get("temporal_plan_hash", "")
+        ),
+        "feature_columns": (
+            metadata.get("feature_columns", [])
+            == model_metadata.get("feature_columns", [])
+        ),
+        "temporal_feature_columns": (
+            metadata.get("temporal_feature_columns", [])
+            == model_metadata.get("temporal_feature_columns", [])
+        ),
+    }
+    model_cache_compatible = all(compatibility_checks.values())
+    if not model_cache_compatible:
+        print(
+            "WARNING: model metadata and cache schema do not match; "
+            f"checks={compatibility_checks}",
+            flush=True,
+        )
 
     responder_indices = {name: metadata["responders"].index(name) for name in AUDIT_RESPONDERS}
     moments = {
@@ -240,6 +265,19 @@ def main():
         "temporal_feature_count": len(metadata["temporal_feature_columns"]),
         "time_monotonic_in_all_shards": all(boundary_checks),
         "valid_cutoff_time_id": cutoff,
+        "model_cache_compatible": model_cache_compatible,
+        "compatibility_checks": compatibility_checks,
+        "cache_schema_version": metadata.get("cache_schema_version"),
+        "cache_temporal_engine_version": metadata.get(
+            "temporal_engine_version"
+        ),
+        "model_temporal_engine_version": model_metadata.get(
+            "temporal_engine_version"
+        ),
+        "cache_temporal_plan_hash": metadata.get("temporal_plan_hash", ""),
+        "model_temporal_plan_hash": model_metadata.get(
+            "temporal_plan_hash", ""
+        ),
         "responders": {},
     }
     for name, column in responder_indices.items():
@@ -265,9 +303,16 @@ def main():
             "constant_mean_baseline_r2": constant_score,
             "best_single_feature": table.iloc[0].to_dict(),
             "asset_mean_baseline_r2": asset_baseline(cache_dir, metadata, column, cutoff),
-            "negative_control": model_negative_controls(
-                cache_dir, metadata, model_dir, name, column, cutoff,
-                args.predict_sample_rows, args.seed,
+            "negative_control": (
+                model_negative_controls(
+                    cache_dir, metadata, model_dir, name, column, cutoff,
+                    args.predict_sample_rows, args.seed,
+                )
+                if model_cache_compatible
+                else {
+                    "available": False,
+                    "reason": "model metadata and cache schema do not match",
+                }
             ),
             "top_features": table.head(20).to_dict(orient="records"),
         }

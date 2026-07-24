@@ -18,7 +18,7 @@ from temporal_features import TemporalFeatureBuilder, temporal_column_names
 
 
 RESPONDERS = ["responder_03", "responder_28", "responder_29", "responder_02"]
-TEMPORAL_ENGINE_VERSION = 2
+TEMPORAL_ENGINE_VERSION = 3
 
 
 def parse_args():
@@ -58,7 +58,24 @@ def parse_args():
         "--ablation-mode",
         choices=["all", "A", "B", "C", "D"],
         default="all",
-        help="A=raw, B=raw+temporal, C=raw+responder_hat, D=all features.",
+        help="Run one legacy variant, or let --experiment-suite select a suite.",
+    )
+    parser.add_argument(
+        "--experiment-suite",
+        choices=["legacy", "next-step", "all"],
+        default="next-step",
+        help=(
+            "legacy runs A/B/C/D; next-step runs responder and temporal-group "
+            "ablations; all runs both suites."
+        ),
+    )
+    parser.add_argument(
+        "--target-experiments",
+        default="",
+        help=(
+            "Optional comma-separated experiment names overriding the suite, "
+            "for example C2,T60,T20_60."
+        ),
     )
     parser.add_argument("--early-stopping", type=int, default=60)
     parser.add_argument("--seed", type=int, default=2026)
@@ -179,9 +196,11 @@ def select_temporal_plan(features: list[str], count: int, importance_path: Path 
             )
             return list(recipes), recipes
     selected = select_temporal_features(features, count, importance_path)
-    from temporal_features import TEMPORAL_SUFFIXES
+    from temporal_features import DEFAULT_TEMPORAL_SUFFIXES
 
-    return selected, {feature: list(TEMPORAL_SUFFIXES) for feature in selected}
+    return selected, {
+        feature: list(DEFAULT_TEMPORAL_SUFFIXES) for feature in selected
+    }
 
 
 def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: int,
@@ -256,7 +275,7 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
             flush()
     flush()
     metadata = {
-        "cache_schema_version": 4,
+        "cache_schema_version": 5,
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
         "temporal_plan_hash": temporal_config_hash(
             plan_path, importance_path, temporal_feature_count
@@ -443,41 +462,159 @@ def weighted_r2(y, pred, weight):
     return float(1.0 - np.sum(weight * (y - pred) ** 2) / denominator) if denominator > 0 else 0.0
 
 
-def target_variant_sequences(args, cache_dir, train_segments, valid_segments,
-                             oof_hat, valid_hat, raw_count, cached_base_count,
-                             variant):
-    raw_indices = np.asarray([*range(raw_count), cached_base_count - 1], dtype=np.int64)
-    specs = {
-        "A": (
-            None, raw_indices,
-        ),
-        "B": (
-            None, None,
-        ),
-        "C": (
-            (oof_hat, valid_hat), raw_indices,
-        ),
-        "D": (
-            (oof_hat, valid_hat), None,
-        ),
+def segmented_validation_scores(time_ids, y, pred, weight, parts: int = 4):
+    """Score contiguous validation-time blocks and report temporal stability."""
+    time_ids = np.asarray(time_ids)
+    unique_times = np.unique(time_ids)
+    blocks = []
+    for index, block_times in enumerate(np.array_split(unique_times, parts), start=1):
+        if len(block_times) == 0:
+            continue
+        start = int(np.searchsorted(time_ids, block_times[0], side="left"))
+        stop = int(np.searchsorted(time_ids, block_times[-1], side="right"))
+        blocks.append(
+            {
+                "part": index,
+                "time_start": int(block_times[0]),
+                "time_end": int(block_times[-1]),
+                "rows": stop - start,
+                "score": weighted_r2(
+                    y[start:stop], pred[start:stop], weight[start:stop]
+                ),
+            }
+        )
+    values = np.asarray([item["score"] for item in blocks], dtype=np.float64)
+    return {
+        "parts": blocks,
+        "mean": float(np.mean(values)) if len(values) else 0.0,
+        "std": float(np.std(values)) if len(values) else 0.0,
+        "minimum": float(np.min(values)) if len(values) else 0.0,
+        "positive_parts": int(np.sum(values > 0.0)),
     }
-    extras, indices = specs[variant]
-    train_extra, valid_extra = (None, None) if extras is None else extras
-    return (
-        training_matrix(args, cache_dir, train_segments, train_extra, indices),
-        training_matrix(args, cache_dir, valid_segments, valid_extra, indices),
+
+
+TARGET_EXPERIMENTS = {
+    "A": {"temporal_groups": (), "responders": ()},
+    "B": {"temporal_groups": None, "responders": ()},
+    "C": {"temporal_groups": (), "responders": tuple(RESPONDERS)},
+    "D": {"temporal_groups": None, "responders": tuple(RESPONDERS)},
+    "C4": {"temporal_groups": (), "responders": tuple(RESPONDERS)},
+    "C2": {
+        "temporal_groups": (),
+        "responders": ("responder_03", "responder_02"),
+    },
+    "T60": {
+        "temporal_groups": ("rolling_std60", "minus_ema60"),
+        "responders": ("responder_03", "responder_02"),
+    },
+    "T20_60": {
+        "temporal_groups": (
+            "rolling_std20", "rolling_std60",
+            "minus_ema20", "minus_ema60",
+        ),
+        "responders": ("responder_03", "responder_02"),
+    },
+    "TZ": {
+        "temporal_groups": (
+            "rolling_std20", "rolling_std60",
+            "minus_ema20", "minus_ema60",
+            "historical_zscore20", "historical_zscore60",
+        ),
+        "responders": ("responder_03", "responder_02"),
+    },
+}
+
+
+def selected_experiments(args) -> list[str]:
+    if args.ablation_mode != "all":
+        return [args.ablation_mode]
+    if args.target_experiments:
+        names = [
+            value.strip() for value in args.target_experiments.split(",")
+            if value.strip()
+        ]
+    elif args.experiment_suite == "legacy":
+        names = ["A", "B", "C", "D"]
+    elif args.experiment_suite == "next-step":
+        names = ["A", "C4", "C2", "T60", "T20_60", "TZ"]
+    else:
+        names = ["A", "B", "C", "D", "C2", "T60", "T20_60", "TZ"]
+    unknown = [name for name in names if name not in TARGET_EXPERIMENTS]
+    if unknown:
+        raise ValueError(
+            f"unknown target experiments: {unknown}; "
+            f"available={list(TARGET_EXPERIMENTS)}"
+        )
+    return list(dict.fromkeys(names))
+
+
+def target_experiment_spec(metadata: dict, name: str) -> dict:
+    definition = TARGET_EXPERIMENTS[name]
+    raw_count = len(metadata["feature_columns"])
+    temporal_columns = list(metadata["temporal_feature_columns"])
+    base_names = [
+        *metadata["feature_columns"], *temporal_columns, "asset_id"
+    ]
+    temporal_groups = definition["temporal_groups"]
+    if temporal_groups is None:
+        temporal_offsets = list(range(len(temporal_columns)))
+    else:
+        temporal_offsets = [
+            index
+            for index, column in enumerate(temporal_columns)
+            if any(
+                column.startswith(f"ts_{group}_")
+                for group in temporal_groups
+            )
+        ]
+    base_indices = [
+        *range(raw_count),
+        *(raw_count + index for index in temporal_offsets),
+        len(base_names) - 1,
+    ]
+    responder_names = list(definition["responders"])
+    responder_indices = [RESPONDERS.index(value) for value in responder_names]
+    feature_names = [
+        *(base_names[index] for index in base_indices),
+        *(f"{value}_hat" for value in responder_names),
+    ]
+    return {
+        "name": name,
+        "temporal_groups": (
+            ["all"] if temporal_groups is None else list(temporal_groups)
+        ),
+        "base_indices": base_indices,
+        "responders": responder_names,
+        "responder_indices": responder_indices,
+        "feature_names": feature_names,
+    }
+
+
+def target_experiment_matrices(args, cache_dir, train_segments, valid_segments,
+                               oof_hat, valid_hat, spec):
+    responder_indices = spec["responder_indices"]
+    train_extra = (
+        np.asarray(oof_hat[:, responder_indices], dtype=np.float32)
+        if responder_indices else None
     )
-
-
-def target_variant_names(metadata, variant):
-    raw = [*metadata["feature_columns"], "asset_id"]
-    temporal = [*metadata["feature_columns"], *metadata["temporal_feature_columns"], "asset_id"]
-    responder_hat = [f"{name}_hat" for name in RESPONDERS]
-    return {"A": raw, "B": temporal, "C": [*raw, *responder_hat], "D": [*temporal, *responder_hat]}[variant]
+    valid_extra = (
+        np.asarray(valid_hat[:, responder_indices], dtype=np.float32)
+        if responder_indices else None
+    )
+    base_indices = np.asarray(spec["base_indices"], dtype=np.int64)
+    return (
+        training_matrix(
+            args, cache_dir, train_segments, train_extra, base_indices
+        ),
+        training_matrix(
+            args, cache_dir, valid_segments, valid_extra, base_indices
+        ),
+    )
 
 
 def main():
     args = parse_args()
+    requested_target_experiments = selected_experiments(args)
     data_root, work_dir, model_dir = Path(args.data_root), Path(args.work_dir), Path(args.model_dir)
     cache_dir = work_dir / "cache"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -504,7 +641,17 @@ def main():
         == TEMPORAL_ENGINE_VERSION
         and existing_model_metadata.get("temporal_plan_hash", "") == requested_plan_hash
     )
-    if args.skip_existing_models and model_metadata_matches and all(path.exists() for path in final_files):
+    target_suite_matches = bool(
+        existing_model_metadata
+        and existing_model_metadata.get("trained_target_experiments")
+        == requested_target_experiments
+    )
+    if (
+        args.skip_existing_models
+        and model_metadata_matches
+        and target_suite_matches
+        and all(path.exists() for path in final_files)
+    ):
         progress("all compatible final model files already exist; training skipped")
         print((model_dir / "metadata.json").read_text(encoding="utf-8"))
         return
@@ -530,7 +677,7 @@ def main():
     if cache_metadata_path.exists():
         existing_metadata = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
         cache_matches = (
-            int(existing_metadata.get("cache_schema_version", 0)) == 4
+            int(existing_metadata.get("cache_schema_version", 0)) == 5
             and int(existing_metadata.get("temporal_engine_version", 0))
             == TEMPORAL_ENGINE_VERSION
             and bool(existing_metadata.get("temporal_recipes"))
@@ -726,24 +873,49 @@ def main():
     y_train = vector_for_segments(cache_dir, oof_segments, "target")
     w_train = vector_for_segments(cache_dir, oof_segments, "weight")
     y_valid = vector_for_segments(cache_dir, valid_segments, "target")
-    cached_base_count = len(metadata["feature_columns"]) + len(metadata["temporal_feature_columns"]) + 1
-    variants = ["A", "B", "C", "D"] if args.ablation_mode == "all" else [args.ablation_mode]
+    valid_times = vector_for_segments(cache_dir, valid_segments, "time")
+    variants = requested_target_experiments
+    experiment_specs = {
+        name: target_experiment_spec(metadata, name) for name in variants
+    }
+    progress(f"target experiments: {variants}")
     ablation_scores = {}
     importance_frames = []
-    target_models = {}
-    valid_predictions = {}
+    best_variant = None
+    best_score = -np.inf
+    best_target_model = None
+    best_valid_prediction = None
     for variant in variants:
-        target_train_x, target_valid_x = target_variant_sequences(
+        spec = experiment_specs[variant]
+        target_train_x, target_valid_x = target_experiment_matrices(
             args, cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
-            len(metadata["feature_columns"]), cached_base_count, variant,
+            spec,
         )
         variant_path = model_dir / f"target_{variant}.txt"
-        if args.skip_existing_models and model_metadata_matches and variant_path.exists():
-            progress(f"loading existing target ablation model: {variant_path.name}")
-            target_model = lgb.Booster(model_file=str(variant_path))
+        old_spec = (
+            existing_model_metadata.get("target_experiment_specs", {}).get(variant)
+            if existing_model_metadata else None
+        )
+        can_load = bool(
+            args.skip_existing_models
+            and model_metadata_matches
+            and variant_path.exists()
+            and old_spec
+            and old_spec.get("base_indices") == spec["base_indices"]
+            and old_spec.get("responders") == spec["responders"]
+        )
+        if can_load:
+            candidate = lgb.Booster(model_file=str(variant_path))
+            can_load = candidate.num_feature() == len(spec["feature_names"])
+        if can_load:
+            progress(f"loading existing target experiment: {variant_path.name}")
+            target_model = candidate
         else:
             progress(
-                f"training target variant {variant}: features={target_train_x[0].shape[0]}, "
+                f"training target experiment {variant}: "
+                f"features={len(spec['feature_names'])}, "
+                f"temporal_groups={spec['temporal_groups']}, "
+                f"responders={spec['responders']}, "
                 f"train_rows={len(target_train_x):,}, valid_rows={len(target_valid_x):,}"
             )
             target_model = train_lgb(
@@ -753,6 +925,9 @@ def main():
             target_model.save_model(str(variant_path))
         prediction = predict_sequence(target_model, target_valid_x, f"target {variant} validation")
         score = weighted_r2(y_valid, prediction, valid_w)
+        segmented = segmented_validation_scores(
+            valid_times, y_valid, prediction, valid_w
+        )
         best_iteration = int(target_model.best_iteration)
         if best_iteration <= 0:
             best_iteration = int(target_model.current_iteration())
@@ -761,28 +936,42 @@ def main():
             "features": target_model.num_feature(),
             "best_iteration": best_iteration,
             "file": variant_path.name,
+            "temporal_groups": spec["temporal_groups"],
+            "responders": spec["responders"],
+            "segmented_validation": segmented,
         }
-        names = target_variant_names(metadata, variant)
         importance_frames.append(
             pd.DataFrame(
                 {
                     "variant": variant,
-                    "feature": names,
+                    "feature": spec["feature_names"],
                     "importance_gain": target_model.feature_importance(importance_type="gain"),
                     "importance_split": target_model.feature_importance(importance_type="split"),
                 }
             )
         )
-        target_models[variant] = target_model
-        valid_predictions[variant] = prediction
-        progress(f"target variant {variant}: zero-mean R2={score:.8f}")
+        if score > best_score:
+            best_variant = variant
+            best_score = score
+            best_target_model = target_model
+            best_valid_prediction = prediction.copy()
+        part_scores = ", ".join(
+            f"P{item['part']}={item['score']:.8f}"
+            for item in segmented["parts"]
+        )
+        progress(
+            f"target experiment {variant}: zero-mean R2={score:.8f}, "
+            f"segment_std={segmented['std']:.8f}; {part_scores}"
+        )
         if args.training_data_mode == "in-memory":
             del target_train_x, target_valid_x
             gc.collect()
 
-    best_variant = max(ablation_scores, key=lambda name: ablation_scores[name]["score"])
-    target_model = target_models[best_variant]
-    valid_pred = valid_predictions[best_variant]
+    if best_variant is None or best_target_model is None:
+        raise RuntimeError("no target experiment was trained")
+    target_model = best_target_model
+    valid_pred = best_valid_prediction
+    best_spec = experiment_specs[best_variant]
     target_path = model_dir / "target_lightgbm.txt"
     target_model.save_model(str(target_path))
     pd.concat(importance_frames, ignore_index=True).to_csv(
@@ -791,6 +980,7 @@ def main():
     (model_dir / "ablation_report.json").write_text(
         json.dumps(
             {"best_variant": best_variant, "scores": ablation_scores,
+             "target_experiment_specs": experiment_specs,
              "responder_diagnostics": responder_diagnostics},
             indent=2,
         ),
@@ -807,6 +997,12 @@ def main():
         "temporal_plan_hash": metadata.get("temporal_plan_hash", ""),
         "responder_models": responder_files, "target_model": "target_lightgbm.txt",
         "target_variant": best_variant,
+        "target_base_indices": best_spec["base_indices"],
+        "target_responders": best_spec["responders"],
+        "target_temporal_groups": best_spec["temporal_groups"],
+        "target_feature_columns": best_spec["feature_names"],
+        "target_experiment_specs": experiment_specs,
+        "trained_target_experiments": variants,
         "ablation_scores": ablation_scores,
         "responder_diagnostics": responder_diagnostics,
         "target_feature_importance": "target_feature_importance.csv",

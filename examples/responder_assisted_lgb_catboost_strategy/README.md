@@ -15,6 +15,37 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 
 Both modes use identical time splits and features. OOF responder folds remain time-separated to prevent leakage. The in-memory mode reports each matrix's row count, feature count, and size; reserve additional RAM for labels, weights, LightGBM bins, and training workspace.
 
+## Target experiment suites
+
+The default `--experiment-suite next-step` trains these target ablations:
+
+- `A`: raw features only.
+- `C4`: raw features plus all four responder predictions.
+- `C2`: raw features plus `responder_02/03`.
+- `T60`: C2 plus `rolling_std60` and `minus_ema60`.
+- `T20_60`: C2 plus 20/60-window volatility and EMA-deviation groups.
+- `TZ`: T20_60 plus 20/60-window historical z-scores.
+
+Each experiment reports the overall validation score and four contiguous
+validation-time scores. The selected model metadata records the exact cached
+column indices and responder subset used by inference.
+
+Run only selected experiments:
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --target-experiments C2,T60,T20_60
+```
+
+Run the original A/B/C/D comparison:
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite legacy
+```
+
+The default temporal fallback no longer creates `delta1` or
+`xs_rank_delta1`. Cache schema version 5 forces older caches and OOF models to
+be rebuilt so the removed columns cannot silently survive.
+
 这个目录用于逐步实现利用 `responder_*` 辅助训练的 LightGBM/CatBoost 策略。
 
 当前第一阶段只分析 responder 与最终 `target` 的关系，不会训练模型，也不会把真实
