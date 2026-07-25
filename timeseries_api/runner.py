@@ -71,6 +71,37 @@ def manifest_files(data_root: str | Path, split: str) -> list[Path]:
     return sorted((data_root / split).glob("*.parquet"))
 
 
+def manifest_row_count(data_root: str | Path, split: str) -> int:
+    manifest_path = Path(data_root) / "manifest.json"
+    if not manifest_path.exists():
+        return 0
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return int(manifest.get("rows", {}).get(split, 0) or 0)
+
+
+def print_progress_bar(label: str, current: int, total: int, started: float,
+                       detail: str = "") -> None:
+    elapsed = max(time.perf_counter() - started, 0.0)
+    if total > 0:
+        current = min(current, total)
+        ratio = current / total
+        width = 30
+        filled = int(width * ratio)
+        bar = "#" * filled + "-" * (width - filled)
+        eta = elapsed * (total - current) / current if current > 0 else 0.0
+        print(
+            f"[{label}] [{bar}] {ratio * 100:6.2f}% "
+            f"({current:,}/{total:,} rows) elapsed={elapsed:.1f}s "
+            f"eta={eta:.1f}s{detail}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[{label}] {current:,} rows elapsed={elapsed:.1f}s{detail}",
+            flush=True,
+        )
+
+
 def visible_test_frame(frame: pd.DataFrame) -> pd.DataFrame:
     forbidden = {"weight", "target", "timestamp", "symbol"}
     visible_cols = [
@@ -173,6 +204,29 @@ def run_loaded_model(
     predict_timeout_count = 0
     aborted_after_timeout = False
     run_start = time.perf_counter()
+    total_rows = manifest_row_count(data_root, split)
+    processed_rows = 0
+    report_interval = max(total_rows // 100, 1) if total_rows else 0
+    next_report = report_interval
+
+    def update_inference_progress(row_count: int, time_id: int) -> None:
+        nonlocal processed_rows, next_report
+        processed_rows += int(row_count)
+        should_report = (
+            processed_rows == row_count
+            or (total_rows and processed_rows >= next_report)
+            or (total_rows and processed_rows >= total_rows)
+            or (not total_rows and len(rows) % 100 == 0)
+        )
+        if should_report:
+            print_progress_bar(
+                "inference", processed_rows, total_rows, run_start,
+                f" | time_id={time_id}, steps={len(rows)}",
+            )
+            if total_rows:
+                while next_report <= processed_rows:
+                    next_report += report_interval
+
     old_path = list(sys.path)
     sys.path.insert(0, str(Path(strategy_dir)))
     try:
@@ -180,6 +234,7 @@ def run_loaded_model(
             if aborted_after_timeout:
                 prediction = zero_predictions(test)
                 rows.append(pd.DataFrame({"row_id": test["row_id"].to_numpy(), "target": prediction}))
+                update_inference_progress(len(test), time_id)
                 continue
 
             elapsed_total = time.perf_counter() - run_start
@@ -195,6 +250,7 @@ def run_loaded_model(
                     )
                 )
                 rows.append(pd.DataFrame({"row_id": test["row_id"].to_numpy(), "target": prediction}))
+                update_inference_progress(len(test), time_id)
                 continue
 
             start = time.perf_counter()
@@ -248,6 +304,7 @@ def run_loaded_model(
                             )
                         )
             rows.append(pd.DataFrame({"row_id": test["row_id"].to_numpy(), "target": prediction}))
+            update_inference_progress(len(test), time_id)
     finally:
         sys.path = old_path
 

@@ -17,7 +17,14 @@ import pandas as pd
 from temporal_features import TemporalFeatureBuilder, temporal_column_names
 
 
-RESPONDERS = ["responder_03", "responder_28", "responder_29", "responder_02"]
+DEFAULT_RESPONDERS = [
+    "responder_03", "responder_28", "responder_29", "responder_02"
+]
+TIER_RESPONDERS = [
+    "responder_14", "responder_09", "responder_08", "responder_10",
+    "responder_22", "responder_23", "responder_21", "responder_42",
+    "responder_07", "responder_15", "responder_41", "responder_24",
+]
 TEMPORAL_ENGINE_VERSION = 3
 
 
@@ -55,6 +62,14 @@ def parse_args():
     parser.add_argument("--responder-rounds", type=int, default=500)
     parser.add_argument("--target-rounds", type=int, default=1200)
     parser.add_argument(
+        "--responders",
+        default="",
+        help=(
+            "Comma-separated responder columns. The single-responder suite "
+            "defaults to the first/second-tier screening candidates."
+        ),
+    )
+    parser.add_argument(
         "--ablation-mode",
         choices=["all", "A", "B", "C", "D"],
         default="all",
@@ -62,11 +77,12 @@ def parse_args():
     )
     parser.add_argument(
         "--experiment-suite",
-        choices=["legacy", "next-step", "all"],
+        choices=["legacy", "next-step", "responder", "single-responder", "all"],
         default="next-step",
         help=(
-            "legacy runs A/B/C/D; next-step runs responder and temporal-group "
-            "ablations; all runs both suites."
+            "legacy runs A/B/C/D; next-step runs the compact target suite; "
+            "responder isolates the default four; single-responder runs one "
+            "full OOF target experiment per screened candidate."
         ),
     )
     parser.add_argument(
@@ -94,6 +110,34 @@ START_TIME = time.perf_counter()
 def progress(message: str) -> None:
     elapsed = time.perf_counter() - START_TIME
     print(f"[progress {elapsed:9.1f}s] {message}", flush=True)
+
+
+def progress_bar(label: str, current: int, total: int, detail: str = "") -> None:
+    total = max(int(total), 1)
+    current = min(max(int(current), 0), total)
+    width = 28
+    filled = int(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    elapsed = time.perf_counter() - START_TIME
+    suffix = f" | {detail}" if detail else ""
+    print(
+        f"[{label:<22}] [{bar}] {100.0 * current / total:6.2f}% "
+        f"({current:,}/{total:,}) {elapsed:9.1f}s{suffix}",
+        flush=True,
+    )
+
+
+def lightgbm_progress(label: str, total_rounds: int):
+    interval = max(1, int(total_rounds) // 20)
+
+    def callback(environment):
+        current = int(environment.iteration) + 1
+        if current == 1 or current == total_rounds or current % interval == 0:
+            progress_bar(label, current, total_rounds, "boosting rounds")
+
+    callback.order = 20
+    callback.before_iteration = False
+    return callback
 
 
 def file_sha256(path: Path | None) -> str:
@@ -205,15 +249,19 @@ def select_temporal_plan(features: list[str], count: int, importance_path: Path 
 
 def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: int,
                 temporal_feature_count: int, importance_path: Path | None,
-                plan_path: Path | None):
+                plan_path: Path | None, responders: list[str]):
     import pyarrow.parquet as pq
 
     files = manifest_files(data_root)
     if not files:
         raise ValueError("no training parquet files")
     columns = list(pq.read_schema(files[0]).names)
+    expected_rows = sum(pq.ParquetFile(path).metadata.num_rows for path in files)
     features = [name for name in columns if name.startswith("feature_")]
-    missing = [name for name in ["target", "weight", *RESPONDERS] if name not in columns]
+    missing = [
+        name for name in ["target", "weight", *responders]
+        if name not in columns
+    ]
     if missing:
         raise ValueError(f"missing columns: {missing}")
 
@@ -229,7 +277,9 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         f"temporal features: {len(temporal_features)} routed raw columns, "
         f"{sum(map(len, temporal_recipes.values()))} derived columns"
     )
-    read_columns = ["time_id", "asset_id", "weight", "target", *RESPONDERS, *features]
+    read_columns = [
+        "time_id", "asset_id", "weight", "target", *responders, *features
+    ]
     buffers: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     buffered_rows = 0
     shards = []
@@ -256,6 +306,10 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
             f"cache shard {shard_id + 1} written: {len(x):,} rows; "
             f"total={total_rows:,}, time_id={int(time_id[0])}..{int(time_id[-1])}"
         )
+        progress_bar(
+            "cache preprocessing", total_rows, expected_rows,
+            f"shards={len(shards)}",
+        )
         buffers, buffered_rows = [], 0
 
     for _, frame in iter_time_frames(files, read_columns, batch_size):
@@ -268,7 +322,7 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         time_id = frame["time_id"].to_numpy(dtype=np.int64)
         target = frame["target"].to_numpy(dtype=np.float32)
         weight = np.maximum(frame["weight"].to_numpy(dtype=np.float32), 0.0)
-        responder = frame.loc[:, RESPONDERS].to_numpy(dtype=np.float32)
+        responder = frame.loc[:, responders].to_numpy(dtype=np.float32)
         buffers.append((x, time_id, target, weight, responder))
         buffered_rows += len(frame)
         if buffered_rows >= shard_rows:
@@ -284,7 +338,7 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         "temporal_features": temporal_features,
         "temporal_recipes": temporal_recipes,
         "temporal_feature_columns": temporal_column_names(temporal_features, temporal_recipes),
-        "responders": RESPONDERS,
+        "responders": responders,
         "shards": shards,
     }
     (cache_dir / "cache.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -422,14 +476,12 @@ def predict_sequence(model, sequence, label: str = "prediction") -> np.ndarray:
         stop = min(start + batch_size, len(sequence))
         output[start:stop] = model.predict(sequence[start:stop])
         if batch_index == 1 or batch_index == total_batches or batch_index % report_every == 0:
-            progress(
-                f"{label}: {stop:,}/{len(sequence):,} rows "
-                f"({100.0 * stop / max(len(sequence), 1):.1f}%)"
-            )
+            progress_bar(label, stop, len(sequence), "prediction rows")
     return output
 
 
-def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight, rounds, args):
+def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight,
+              rounds, args, progress_label="LightGBM"):
     params = {
         "objective": "regression", "metric": "l2", "learning_rate": 0.03,
         "num_leaves": 64, "min_data_in_leaf": 500, "feature_fraction": 0.8,
@@ -439,10 +491,15 @@ def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight
     train_set = lgb.Dataset(sequence, label=label, weight=weight, free_raw_data=False)
     valid_set = lgb.Dataset(valid_sequence, label=valid_label, weight=valid_weight, reference=train_set, free_raw_data=False)
     return lgb.train(params, train_set, num_boost_round=rounds, valid_sets=[valid_set],
-                     callbacks=[lgb.early_stopping(args.early_stopping), lgb.log_evaluation(50)])
+                     callbacks=[
+                         lgb.early_stopping(args.early_stopping),
+                         lightgbm_progress(progress_label, rounds),
+                         lgb.log_evaluation(50),
+                     ])
 
 
-def train_lgb_fixed(sequence, label, weight, rounds, args):
+def train_lgb_fixed(sequence, label, weight, rounds, args,
+                    progress_label="LightGBM"):
     params = {
         "objective": "regression", "metric": "l2", "learning_rate": 0.03,
         "num_leaves": 64, "min_data_in_leaf": 500, "feature_fraction": 0.8,
@@ -451,7 +508,10 @@ def train_lgb_fixed(sequence, label, weight, rounds, args):
     }
     train_set = lgb.Dataset(sequence, label=label, weight=weight, free_raw_data=False)
     return lgb.train(params, train_set, num_boost_round=max(1, int(rounds)),
-                     callbacks=[lgb.log_evaluation(50)])
+                     callbacks=[
+                         lightgbm_progress(progress_label, max(1, int(rounds))),
+                         lgb.log_evaluation(50),
+                     ])
 
 
 def weighted_r2(y, pred, weight):
@@ -496,12 +556,36 @@ def segmented_validation_scores(time_ids, y, pred, weight, parts: int = 4):
 TARGET_EXPERIMENTS = {
     "A": {"temporal_groups": (), "responders": ()},
     "B": {"temporal_groups": None, "responders": ()},
-    "C": {"temporal_groups": (), "responders": tuple(RESPONDERS)},
-    "D": {"temporal_groups": None, "responders": tuple(RESPONDERS)},
-    "C4": {"temporal_groups": (), "responders": tuple(RESPONDERS)},
+    "C": {"temporal_groups": (), "responders": tuple(DEFAULT_RESPONDERS)},
+    "D": {"temporal_groups": None, "responders": tuple(DEFAULT_RESPONDERS)},
+    "C4": {"temporal_groups": (), "responders": tuple(DEFAULT_RESPONDERS)},
     "C2": {
         "temporal_groups": (),
         "responders": ("responder_03", "responder_02"),
+    },
+    "R02": {
+        "temporal_groups": (),
+        "responders": ("responder_02",),
+    },
+    "R03": {
+        "temporal_groups": (),
+        "responders": ("responder_03",),
+    },
+    "R28": {
+        "temporal_groups": (),
+        "responders": ("responder_28",),
+    },
+    "R29": {
+        "temporal_groups": (),
+        "responders": ("responder_29",),
+    },
+    "C2_R28": {
+        "temporal_groups": (),
+        "responders": ("responder_03", "responder_02", "responder_28"),
+    },
+    "C2_R29": {
+        "temporal_groups": (),
+        "responders": ("responder_03", "responder_02", "responder_29"),
     },
     "T60": {
         "temporal_groups": ("rolling_std60", "minus_ema60"),
@@ -525,7 +609,27 @@ TARGET_EXPERIMENTS = {
 }
 
 
-def selected_experiments(args) -> list[str]:
+def configured_responders(args) -> list[str]:
+    if args.responders:
+        values = [
+            value.strip() for value in args.responders.split(",")
+            if value.strip()
+        ]
+    elif args.experiment_suite == "single-responder":
+        values = list(TIER_RESPONDERS)
+    else:
+        values = list(DEFAULT_RESPONDERS)
+    if not values:
+        raise ValueError("at least one responder must be configured")
+    if len(values) != len(set(values)):
+        raise ValueError(f"duplicate responder names: {values}")
+    invalid = [value for value in values if not value.startswith("responder_")]
+    if invalid:
+        raise ValueError(f"invalid responder names: {invalid}")
+    return values
+
+
+def selected_experiments(args, responders: list[str]) -> list[str]:
     if args.ablation_mode != "all":
         return [args.ablation_mode]
     if args.target_experiments:
@@ -537,9 +641,24 @@ def selected_experiments(args) -> list[str]:
         names = ["A", "B", "C", "D"]
     elif args.experiment_suite == "next-step":
         names = ["A", "C4", "C2", "T60", "T20_60", "TZ"]
+    elif args.experiment_suite == "responder":
+        names = [
+            "A", "R02", "R03", "R28", "R29",
+            "C2", "C2_R28", "C2_R29", "C4",
+        ]
+    elif args.experiment_suite == "single-responder":
+        names = ["A", *(f"S_{name}" for name in responders)]
     else:
-        names = ["A", "B", "C", "D", "C2", "T60", "T20_60", "TZ"]
-    unknown = [name for name in names if name not in TARGET_EXPERIMENTS]
+        names = [
+            "A", "B", "C", "D",
+            "R02", "R03", "R28", "R29",
+            "C2", "C2_R28", "C2_R29", "C4",
+            "T60", "T20_60", "TZ",
+        ]
+    unknown = [
+        name for name in names
+        if name not in TARGET_EXPERIMENTS and not name.startswith("S_responder_")
+    ]
     if unknown:
         raise ValueError(
             f"unknown target experiments: {unknown}; "
@@ -548,8 +667,15 @@ def selected_experiments(args) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def target_experiment_spec(metadata: dict, name: str) -> dict:
-    definition = TARGET_EXPERIMENTS[name]
+def target_experiment_spec(metadata: dict, name: str,
+                           active_responders: list[str]) -> dict:
+    if name.startswith("S_responder_"):
+        definition = {
+            "temporal_groups": (),
+            "responders": (name.removeprefix("S_"),),
+        }
+    else:
+        definition = TARGET_EXPERIMENTS[name]
     raw_count = len(metadata["feature_columns"])
     temporal_columns = list(metadata["temporal_feature_columns"])
     base_names = [
@@ -573,7 +699,16 @@ def target_experiment_spec(metadata: dict, name: str) -> dict:
         len(base_names) - 1,
     ]
     responder_names = list(definition["responders"])
-    responder_indices = [RESPONDERS.index(value) for value in responder_names]
+    missing = [
+        value for value in responder_names if value not in active_responders
+    ]
+    if missing:
+        raise ValueError(
+            f"experiment {name} needs responders not present in cache: {missing}"
+        )
+    responder_indices = [
+        active_responders.index(value) for value in responder_names
+    ]
     feature_names = [
         *(base_names[index] for index in base_indices),
         *(f"{value}_hat" for value in responder_names),
@@ -614,11 +749,12 @@ def target_experiment_matrices(args, cache_dir, train_segments, valid_segments,
 
 def main():
     args = parse_args()
-    requested_target_experiments = selected_experiments(args)
+    responders = configured_responders(args)
+    requested_target_experiments = selected_experiments(args, responders)
     data_root, work_dir, model_dir = Path(args.data_root), Path(args.work_dir), Path(args.model_dir)
     cache_dir = work_dir / "cache"
     model_dir.mkdir(parents=True, exist_ok=True)
-    final_files = [model_dir / f"{name}.txt" for name in RESPONDERS]
+    final_files = [model_dir / f"{name}.txt" for name in responders]
     final_files.extend([model_dir / "target_lightgbm.txt", model_dir / "metadata.json"])
     existing_model_metadata = None
     if (model_dir / "metadata.json").exists():
@@ -640,6 +776,7 @@ def main():
         and int(existing_model_metadata.get("temporal_engine_version", 0))
         == TEMPORAL_ENGINE_VERSION
         and existing_model_metadata.get("temporal_plan_hash", "") == requested_plan_hash
+        and existing_model_metadata.get("responders") == responders
     )
     target_suite_matches = bool(
         existing_model_metadata
@@ -657,7 +794,7 @@ def main():
         return
 
     progress(
-        f"starting training: responders={RESPONDERS}, "
+        f"starting training: responders={responders}, "
         f"training_data_mode={args.training_data_mode}, "
         f"skip_existing_models={args.skip_existing_models}"
     )
@@ -683,6 +820,7 @@ def main():
             and bool(existing_metadata.get("temporal_recipes"))
             and existing_metadata.get("temporal_plan_hash", "")
             == temporal_config_hash(plan_path, importance_path, args.temporal_feature_count)
+            and existing_metadata.get("responders") == responders
         )
         if not cache_matches:
             progress("existing cache has a different temporal feature schema; rebuilding it")
@@ -697,6 +835,7 @@ def main():
         metadata = build_cache(
             data_root, cache_dir, args.shard_rows, args.batch_size,
             args.temporal_feature_count, importance_path, plan_path,
+            responders,
         )
 
     progress(f"scanning time_id from {len(metadata['shards'])} cache shards")
@@ -714,12 +853,17 @@ def main():
     oof_segments = segments_for_range(cache_dir, metadata, int(train_times[warmup_index]), valid_cutoff)
     oof_rows = sum(end - start for _, start, end in oof_segments)
     oof_path = work_dir / "oof_responder_hat.dat"
-    oof_hat = np.memmap(oof_path, dtype="float32", mode="w+", shape=(oof_rows, len(RESPONDERS)))
+    oof_hat = np.memmap(
+        oof_path, dtype="float32", mode="w+",
+        shape=(oof_rows, len(responders)),
+    )
     oof_cursor = 0
-    responder_best_iterations: dict[str, list[int]] = {name: [] for name in RESPONDERS}
+    responder_best_iterations: dict[str, list[int]] = {
+        name: [] for name in responders
+    }
     responder_diagnostics = {
         name: {"folds": [], "oof_squared_error": 0.0, "oof_zero_denominator": 0.0}
-        for name in RESPONDERS
+        for name in responders
     }
     oof_model_dir = work_dir / "oof_models"
     oof_signature_payload = {
@@ -728,6 +872,7 @@ def main():
         "temporal_recipes": metadata["temporal_recipes"],
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
         "temporal_plan_hash": metadata.get("temporal_plan_hash", ""),
+        "responders": responders,
         "valid_cutoff": valid_cutoff,
         "oof_folds": args.oof_folds,
         "warmup_fraction": args.warmup_fraction,
@@ -765,18 +910,20 @@ def main():
             f"OOF fold {fold + 1}/{args.oof_folds}: train_rows={len(fit_x):,}, "
             f"predict_rows={len(pred_x):,}, time_id={fold_start}..{fold_end - 1}"
         )
-        for column, name in enumerate(RESPONDERS):
+        for column, name in enumerate(responders):
             fold_model_path = oof_model_dir / f"fold_{fold:02d}_{name}.txt"
             if args.skip_existing_models and fold_model_path.exists():
                 progress(f"loading existing OOF model: {fold_model_path.name}")
                 model = lgb.Booster(model_file=str(fold_model_path))
             else:
                 progress(
-                    f"training OOF model {column + 1}/{len(RESPONDERS)}: "
+                    f"training OOF model {column + 1}/{len(responders)}: "
                     f"fold={fold + 1}, responder={name}"
                 )
                 model = train_lgb(fit_x, responders_fit[:, column], fit_w, pred_x,
-                                  responders_pred[:, column], pred_w, args.responder_rounds, args)
+                                  responders_pred[:, column], pred_w,
+                                  args.responder_rounds, args,
+                                  f"OOF {fold + 1} {name}")
                 model.save_model(str(fold_model_path))
                 progress(f"saved OOF model: {fold_model_path.name}")
             oof_hat[oof_cursor:oof_cursor + len(pred_x), column] = predict_sequence(
@@ -817,6 +964,12 @@ def main():
             if best_iteration <= 0:
                 best_iteration = int(args.responder_rounds)
             responder_best_iterations[name].append(best_iteration)
+            progress_bar(
+                "OOF responder models",
+                fold * len(responders) + column + 1,
+                args.oof_folds * len(responders),
+                f"fold={fold + 1}, responder={name}",
+            )
         oof_cursor += len(pred_x)
         oof_hat.flush()
         if args.training_data_mode == "in-memory":
@@ -831,9 +984,9 @@ def main():
     train_w = vector_for_segments(cache_dir, train_segments, "weight")
     valid_w = vector_for_segments(cache_dir, valid_segments, "weight")
     train_responders = vector_for_segments(cache_dir, train_segments, "responder")
-    valid_hat = np.empty((len(valid_x), len(RESPONDERS)), dtype=np.float32)
+    valid_hat = np.empty((len(valid_x), len(responders)), dtype=np.float32)
     responder_files = {}
-    for column, name in enumerate(RESPONDERS):
+    for column, name in enumerate(responders):
         final_rounds = int(np.median(responder_best_iterations[name]))
         filename = f"{name}.txt"
         model_path = model_dir / filename
@@ -842,11 +995,12 @@ def main():
             model = lgb.Booster(model_file=str(model_path))
         else:
             progress(
-                f"training final responder {column + 1}/{len(RESPONDERS)}: "
+                f"training final responder {column + 1}/{len(responders)}: "
                 f"{name}, rounds={final_rounds}, rows={len(train_x):,}"
             )
             model = train_lgb_fixed(
-                train_x, train_responders[:, column], train_w, final_rounds, args
+                train_x, train_responders[:, column], train_w, final_rounds,
+                args, f"final {name}",
             )
             model.save_model(str(model_path))
             progress(f"saved final responder model: {filename}")
@@ -865,6 +1019,9 @@ def main():
             f"validation R2={responder_diagnostics[name]['valid_score']:.8f}"
         )
         responder_files[name] = filename
+        progress_bar(
+            "final responders", column + 1, len(responders), name
+        )
 
     if args.training_data_mode == "in-memory":
         del train_x, valid_x, train_responders
@@ -876,7 +1033,8 @@ def main():
     valid_times = vector_for_segments(cache_dir, valid_segments, "time")
     variants = requested_target_experiments
     experiment_specs = {
-        name: target_experiment_spec(metadata, name) for name in variants
+        name: target_experiment_spec(metadata, name, responders)
+        for name in variants
     }
     progress(f"target experiments: {variants}")
     ablation_scores = {}
@@ -921,6 +1079,7 @@ def main():
             target_model = train_lgb(
                 target_train_x, y_train, w_train, target_valid_x,
                 y_valid, valid_w, args.target_rounds, args,
+                f"target {variant}",
             )
             target_model.save_model(str(variant_path))
         prediction = predict_sequence(target_model, target_valid_x, f"target {variant} validation")
@@ -963,9 +1122,26 @@ def main():
             f"target experiment {variant}: zero-mean R2={score:.8f}, "
             f"segment_std={segmented['std']:.8f}; {part_scores}"
         )
+        progress_bar(
+            "target experiments",
+            variants.index(variant) + 1,
+            len(variants),
+            f"{variant}, R2={score:.8f}",
+        )
         if args.training_data_mode == "in-memory":
             del target_train_x, target_valid_x
             gc.collect()
+
+    if "A" in ablation_scores:
+        baseline_score = float(ablation_scores["A"]["score"])
+        baseline_parts = ablation_scores["A"]["segmented_validation"]["parts"]
+        for result in ablation_scores.values():
+            result["delta_vs_A"] = float(result["score"] - baseline_score)
+            result_parts = result["segmented_validation"]["parts"]
+            result["segment_delta_vs_A"] = [
+                float(current["score"] - baseline["score"])
+                for current, baseline in zip(result_parts, baseline_parts)
+            ]
 
     if best_variant is None or best_target_model is None:
         raise RuntimeError("no target experiment was trained")
@@ -989,7 +1165,7 @@ def main():
     clip_min, clip_max = np.quantile(valid_pred[np.isfinite(valid_pred)], [0.001, 0.999])
     output = {
         "strategy": "responder_assisted_lgb_catboost_strategy",
-        "feature_columns": metadata["feature_columns"], "responders": RESPONDERS,
+        "feature_columns": metadata["feature_columns"], "responders": responders,
         "temporal_features": metadata["temporal_features"],
         "temporal_recipes": metadata["temporal_recipes"],
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,

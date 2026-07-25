@@ -1,178 +1,187 @@
-# Responder-assisted LightGBM/CatBoost Strategy
+# Responder 辅助 LightGBM 时序策略
 
-## Training data modes
+该目录实现严格按时间切分的 responder stacking 策略。训练阶段先使用特征预测 responder，再把无泄漏的 OOF `responder_hat` 与原始及时序特征一起用于 target 模型；推理阶段只使用特征和 responder 模型预测值，不会访问真实 responder。
 
-The trainer supports two data-loading backends:
+## 目录与产物
 
-- `--training-data-mode out-of-core` (default): read cached shards through `lightgbm.Sequence`.
-- `--training-data-mode in-memory`: concatenate the current training and validation ranges into contiguous `float32` matrices before fitting.
+- `train.py`：缓存预处理、OOF responder、target 消融和最终模型训练。
+- `main.py`：时序 API 推理入口。
+- `temporal_features.py`：严格历史时序特征状态机。
+- `screen_all_responders.py`：对原始数据中的全部 responder 做潜力筛选。
+- `analyze_responders.py`：分析 responder 与 target 的相关性和时间稳定性。
+- `analyze_feature_temporal_types.py`：判断 feature 适合的时序变换类型。
+- `audit_responders.py`：审计 responder 可预测性、均值基线和模型缓存一致性。
+- `pull_remote_results.bat`：从远程训练机传回模型、分析与提交文件。
+- `work/`：缓存、OOF 模型和中间文件，不应提交 Git。
+- `model/`：最终模型、metadata、消融报告和特征重要性。
+- `analysis/`：responder 与时序特征分析结果。
+- `audit/`：responder 审计报告。
 
-Use the in-memory backend when the machine has enough RAM:
+## 环境
 
-```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory
-```
-
-Both modes use identical time splits and features. OOF responder folds remain time-separated to prevent leakage. The in-memory mode reports each matrix's row count, feature count, and size; reserve additional RAM for labels, weights, LightGBM bins, and training workspace.
-
-## Target experiment suites
-
-The default `--experiment-suite next-step` trains these target ablations:
-
-- `A`: raw features only.
-- `C4`: raw features plus all four responder predictions.
-- `C2`: raw features plus `responder_02/03`.
-- `T60`: C2 plus `rolling_std60` and `minus_ema60`.
-- `T20_60`: C2 plus 20/60-window volatility and EMA-deviation groups.
-- `TZ`: T20_60 plus 20/60-window historical z-scores.
-
-Each experiment reports the overall validation score and four contiguous
-validation-time scores. The selected model metadata records the exact cached
-column indices and responder subset used by inference.
-
-Run only selected experiments:
+推荐 Windows Python 3.12，并在独立虚拟环境中安装依赖：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --target-experiments C2,T60,T20_60
+python -m pip install -r examples/responder_assisted_lgb_catboost_strategy/requirement.txt
 ```
 
-Run the original A/B/C/D comparison:
+## 推荐工作流
+
+### 1. 筛选全部 responder
+
+数据 manifest 当前记录47个 responder。脚本自动从 Parquet schema 发现全部 `responder_*`，不会写死编号。数据按连续时间拆成训练60%、校准20%和最终评估20%，输出 responder 的 centered R²、预测相关性，以及加入 baseline target 残差后的样本外增量。
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite legacy
+python examples/responder_assisted_lgb_catboost_strategy/screen_all_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis/all_responders --max-rows 500000 --candidate-count 12 --threads 8
 ```
 
-The default temporal fallback no longer creates `delta1` or
-`xs_rank_delta1`. Cache schema version 5 forces older caches and OOF models to
-be rebuilt so the removed columns cannot silently survive.
+主要输出：
 
-这个目录用于逐步实现利用 `responder_*` 辅助训练的 LightGBM/CatBoost 策略。
+- `analysis/all_responders/all_responder_potential.csv`：全部 responder 排名。
+- `analysis/all_responders/responder_candidates.json`：同时满足 centered R² 和 target 增量为正的候选。
 
-当前第一阶段只分析 responder 与最终 `target` 的关系，不会训练模型，也不会把真实
-responder 当作推理特征。正式测试不提供 `responder_*`，后续阶段将使用严格时间
-OOF 的 responder 预测进行 stacking。
+该步骤是低成本初筛，候选 responder 仍需经过完整 expanding-window OOF 和 target 消融确认。
 
-## 第一阶段：Responder 相关性分析
-
-```bash
-python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py \
-  --data-root data \
-  --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
-```
-
-Windows PowerShell 单行命令：
+### 2. 分析 responder 与 target 的直接关系
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
+python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis --max-rows 2000000 --time-bins 10
 ```
 
-默认最多抽样 2,000,000 行。小规模冒烟测试：
+输出全局加权相关、去时间均值相关、去资产均值相关、逐时点截面 IC、分段稳定性和综合筛选分数。
 
-```powershell
-python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis_smoke --max-rows 100000 --time-bins 5
-```
-
-输出文件：
-
-- `responder_summary.csv`：综合相关性和稳定性排名；
-- `responder_period_correlations.csv`：连续时间段内的加权相关性；
-- `responder_time_ic.csv`：每个 `time_id` 的截面 Spearman IC；
-- `analysis_report.json`：运行信息和前十名 responder。
-
-`responder_summary.csv` 包含：
-
-- 全局加权 Pearson、普通 Pearson 和 Spearman；
-- 按 `time_id` 去均值后的相关性；
-- 按 `asset_id` 去均值后的相关性；
-- 逐时点截面 Spearman IC 的均值、标准差、ICIR 和方向稳定性；
-- 连续时间段相关性的均值、波动、方向稳定性和最近一期相关性；
-- 用于初筛的 `screening_score`。
-
-`screening_score` 只用于缩小候选 responder 范围。最终是否采用某个 responder，
-仍需在后续阶段通过严格时间 OOF responder 预测和 target 样本外增益判断。
-
-## 第二阶段：Responder OOF Stacking + LightGBM
-
-当前实现使用以下四个 responder：
-
-```text
-responder_03, responder_28, responder_29, responder_02
-```
-
-模型输入还会从重要性最高的 30 个原始 feature 生成 330 个时序特征，每个原始
-feature 对应：`lag1`、`lag5`、`delta1`、`delta5`、历史 `EMA5`、历史 `EMA20`、
-相对 EMA20 偏离、历史 20 期标准差、历史 z-score、当前截面 rank 和截面 rank
-相对上一期的变化。所有历史统计都只使用当前 `time_id` 之前的数据。
-
-根据首次消融的重要性结果，当前路由会移除 `delta1` 和 `xs_rank_delta1`，并在已有
-中期类型上自动增加 `lag20`、`delta20`、`EMA60`、相对 EMA60 偏离、60期滚动
-标准差和60期历史 z-score。`lag1` 与 `EMA5` 仍有一定 gain，因此暂时保留。
-
-推荐先运行无监督时序类型分析，让每个 feature 只生成适合自己的派生特征：
+### 3. 生成时序特征路由
 
 ```powershell
 python examples/responder_assisted_lgb_catboost_strategy/analyze_feature_temporal_types.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
 ```
 
-该脚本输出 `feature_temporal_statistics.csv`、`feature_temporal_routes.csv` 和
-`temporal_feature_plan.json`。训练脚本默认读取 `analysis/temporal_feature_plan.json`；
-也可以使用 `--temporal-plan` 指定其他计划。计划不存在时才回退到前 30 个 feature
-统一生成 11 种特征。
+训练脚本默认读取 `analysis/temporal_feature_plan.json`。若文件不存在，则对选中的原始特征使用默认时序变换；默认已排除低价值的 `delta1` 和 `xs_rank_delta1`。
 
-训练链路：
+### 4. 训练模型
 
-1. 按完整 `time_id` 流式读取 Parquet，避免截断资产截面；
-2. 将原始 `feature_* + asset_id` 写成磁盘 NumPy shards；
-3. 使用 expanding-window 时间折训练 responder LightGBM，生成无泄漏 OOF 预测；
-4. 用 OOF `responder_hat` 和原始特征联合训练 target LightGBM；
-5. 在验证截止点之前的全部数据上重训四个 responder 模型；
-6. 推理时先预测 responder，再预测 target。
-
-LightGBM 通过磁盘分片 `Sequence` 联合构造 Dataset。它不会一次性创建完整的
-float32 特征矩阵；模型看到的是所选时间区间内的全部分片，而不是逐分片重复 `fit`。
-LightGBM 内部仍会为量化后的 Dataset、梯度和树结构分配内存。
+内存充足时推荐一次性装载当前训练和验证区间：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --threads 8
 ```
 
-首次运行会建立磁盘缓存，后续运行默认复用。数据或特征定义变化后添加
-`--rebuild-cache`。缓存可能占用数十 GB 磁盘空间。
-
-断点恢复并跳过已有模型：
+内存较小时使用磁盘分片外存训练：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --skip-existing-models
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode out-of-core --threads 8
 ```
 
-启用该选项后，程序会复用 `work/oof_models` 中已有的 OOF 折模型以及 `model`
-中的最终模型，仅训练缺失文件。如果五个最终模型和 `metadata.json` 全部存在，程序
-会在启动时直接输出已有 metadata 并结束。训练过程中会输出缓存分片、OOF 折、
-各 responder、分批预测和 target 模型的进度。
+两种模式使用完全相同的时间切分、特征和标签。`in-memory` 使用连续 `float32` 矩阵；`out-of-core` 使用缓存分片和 `lightgbm.Sequence`。
 
-默认 `--ablation-mode all` 会训练并比较四个 target 模型：
+断点恢复并跳过兼容的已有模型：
 
-- A：原始 feature + asset_id；
-- B：A + 路由时序特征；
-- C：A + responder_hat；
-- D：A + 路由时序特征 + responder_hat。
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --skip-existing-models --threads 8
+```
 
-验证分数最高的变体会保存为正式 `target_lightgbm.txt`。详细结果写入
-`model/ablation_report.json`，逐模型 gain/split importance 写入
-`model/target_feature_importance.csv`。也可通过 `--ablation-mode A` 等只训练指定变体。
+强制重建缓存：
 
-审计高 R² responder：
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --rebuild-cache --threads 8
+```
+
+### 5. Target 消融套件
+
+默认 `--experiment-suite next-step` 训练：
+
+- `A`：原始特征。
+- `C4`：原始特征加四个 responder_hat。
+- `C2`：原始特征加 responder_02/03。
+- `T60`：C2 加60期波动率和 EMA 偏离。
+- `T20_60`：C2 加20/60期波动率和 EMA 偏离。
+- `TZ`：T20_60 加20/60期历史 z-score。
+
+只训练指定实验：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --target-experiments C2,T60,T20_60 --threads 8
+```
+
+原始 A/B/C/D 套件：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite legacy --threads 8
+```
+
+当前四个 responder 的专项消融：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite responder --threads 8
+```
+
+对全量筛选结果中的一二梯队12个 responder 运行完整 OOF 单 responder 实验：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_single_responder --model-dir examples/responder_assisted_lgb_catboost_strategy/model_single_responder --training-data-mode in-memory --experiment-suite single-responder --threads 8
+```
+
+该套件默认使用 `responder_14,09,08,10,22,23,21,42,07,15,41,24`，训练 A 基线以及每个候选单独加入一个 OOF `responder_hat` 的12个 target 模型。建议使用独立的 `work_single_responder/` 和 `model_single_responder/`，避免覆盖当前正式 C4。
+
+也可以显式指定 responder 列表：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_custom_responders --model-dir examples/responder_assisted_lgb_catboost_strategy/model_custom_responders --training-data-mode in-memory --experiment-suite single-responder --responders responder_14,responder_09,responder_22 --threads 8
+```
+
+每个实验都会输出整体验证 R²、四个连续验证时间段的 R²、分段标准差、最低分、最佳迭代轮数和特征重要性。整体验证分数最高的模型保存为 `model/target_lightgbm.txt`，精确特征列顺序和 responder 子集写入 `model/metadata.json`。
+
+### 6. 审计 responder
+
+必须使用与模型相同的 `work/cache`：
 
 ```powershell
 python examples/responder_assisted_lgb_catboost_strategy/audit_responders.py --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --output-dir examples/responder_assisted_lgb_catboost_strategy/audit
 ```
 
-该脚本检查缓存维度和时间顺序，计算每个输入与 `responder_02/03` 的训练/验证加权
-相关性、单特征线性样本外 R²、asset 固定均值基线，并在 LightGBM 可用时执行标签
-打乱负对照。详细特征结果和 JSON 报告写入 `audit/`。
+报告中的 `model_cache_compatible` 应为 `true`，cache schema、temporal engine version、plan hash 和特征列必须与模型一致。
 
-本地顺序推理验证：
+### 7. 本地时序推理
 
 ```powershell
 python timeseries_api/run_timeseries_api.py --data-root data --strategy-dir examples/responder_assisted_lgb_catboost_strategy --output examples/responder_assisted_lgb_catboost_strategy/submission.csv
 ```
+
+推理严格要求 `time_id` 递增。模型先更新历史时序状态，再预测需要的 responder_hat，最后预测 target。
+
+### 8. 从远程电脑传回结果
+
+默认远程仓库为 `ustc-lab:~/xhth`：
+
+```bat
+examples\responder_assisted_lgb_catboost_strategy\pull_remote_results.bat
+```
+
+覆盖远程主机和路径：
+
+```bat
+examples\responder_assisted_lgb_catboost_strategy\pull_remote_results.bat HOST REMOTE_REPO
+```
+
+脚本传回 `model/`、`audit/`、可选的 `analysis/` 和 `submission.csv`，不会传输巨大的 `work/cache` 与 OOF 中间文件。
+
+## 进度显示
+
+训练过程显示：
+
+- 缓存预处理行数和分片数。
+- 每个 LightGBM 的 boosting 轮次。
+- OOF responder 模型总体完成比例。
+- 最终 responder 模型完成比例。
+- target 实验完成比例。
+- 验证预测批次完成比例。
+
+推理过程根据 manifest 中的总行数显示百分比、已完成行数、当前 `time_id`、时间步数量、累计耗时和预计剩余时间。
+
+## 重要约束
+
+- 真实 responder 只存在于训练数据，推理时只能使用 responder 模型预测值。
+- OOF responder 必须严格按时间 expanding-window 生成，不能用同一训练样本的拟合值训练 target。
+- 时序特征只能使用当前 `time_id` 之前的历史状态。
+- 不要设置 `predict_disable_shape_check=true` 绕过维度错误；应检查 metadata 和模型列顺序。
+- 不要把 `work/`、`model/`、Parquet、NumPy 缓存或虚拟环境提交到 Git。
