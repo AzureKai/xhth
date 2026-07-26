@@ -27,7 +27,25 @@ python -m pip install -r examples/responder_assisted_lgb_catboost_strategy/requi
 
 ## 推荐工作流
 
-### 1. 筛选全部 responder
+### 1. 多折稳健筛选全部 responder
+
+推荐先运行4折 expanding-window 多输出 Ridge 筛选、OOF 相关性聚类和轻量 LightGBM 复核：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/screen_responders_multifold.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis/multifold_responders --max-rows 300000 --folds 4 --refine-count 8 --threads 8
+```
+
+每个时间折都按“历史训练→当前块前半段校准残差系数→当前块后半段评估”执行。默认要求 centered R²不低于0.01、至少3/4折 target 增量为正、最后一折为正且稳健分数为正。通过者按 OOF `responder_hat` 绝对相关0.95聚类，每簇只选择一个代表进入轻量 LightGBM 复核。
+
+主要输出：
+
+- `multifold_ridge_ranking.csv`：全部 responder 的 Ridge 多折稳健排名。
+- `multifold_ridge_folds.csv`：每个 responder、每个时间折的详细指标。
+- `multifold_hat_correlations.csv`：OOF responder_hat 相关矩阵。
+- `multifold_lightgbm_ranking.csv`：各簇代表的轻量 LightGBM 多折排名。
+- `multifold_candidates.json`：冗余簇和最终建议候选。
+
+### 2. 单区间快速筛选全部 responder
 
 数据 manifest 当前记录47个 responder。脚本自动从 Parquet schema 发现全部 `responder_*`，不会写死编号。数据按连续时间拆成训练60%、校准20%和最终评估20%，输出 responder 的 centered R²、预测相关性，以及加入 baseline target 残差后的样本外增量。
 
@@ -42,7 +60,7 @@ python examples/responder_assisted_lgb_catboost_strategy/screen_all_responders.p
 
 该步骤是低成本初筛，候选 responder 仍需经过完整 expanding-window OOF 和 target 消融确认。
 
-### 2. 分析 responder 与 target 的直接关系
+### 3. 分析 responder 与 target 的直接关系
 
 ```powershell
 python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis --max-rows 2000000 --time-bins 10
@@ -50,7 +68,7 @@ python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py -
 
 输出全局加权相关、去时间均值相关、去资产均值相关、逐时点截面 IC、分段稳定性和综合筛选分数。
 
-### 3. 生成时序特征路由
+### 4. 生成时序特征路由
 
 ```powershell
 python examples/responder_assisted_lgb_catboost_strategy/analyze_feature_temporal_types.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
@@ -58,7 +76,7 @@ python examples/responder_assisted_lgb_catboost_strategy/analyze_feature_tempora
 
 训练脚本默认读取 `analysis/temporal_feature_plan.json`。若文件不存在，则对选中的原始特征使用默认时序变换；默认已排除低价值的 `delta1` 和 `xs_rank_delta1`。
 
-### 4. 训练模型
+### 5. 训练模型
 
 内存充足时推荐一次性装载当前训练和验证区间：
 
@@ -86,7 +104,7 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --rebuild-cache --threads 8
 ```
 
-### 5. Target 消融套件
+### 6. Target 消融套件
 
 默认 `--experiment-suite next-step` 训练：
 
@@ -131,7 +149,7 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 
 每个实验都会输出整体验证 R²、四个连续验证时间段的 R²、分段标准差、最低分、最佳迭代轮数和特征重要性。整体验证分数最高的模型保存为 `model/target_lightgbm.txt`，精确特征列顺序和 responder 子集写入 `model/metadata.json`。
 
-### 6. 审计 responder
+### 7. 审计 responder
 
 必须使用与模型相同的 `work/cache`：
 
@@ -141,7 +159,7 @@ python examples/responder_assisted_lgb_catboost_strategy/audit_responders.py --w
 
 报告中的 `model_cache_compatible` 应为 `true`，cache schema、temporal engine version、plan hash 和特征列必须与模型一致。
 
-### 7. 本地时序推理
+### 8. 本地时序推理
 
 ```powershell
 python timeseries_api/run_timeseries_api.py --data-root data --strategy-dir examples/responder_assisted_lgb_catboost_strategy --output examples/responder_assisted_lgb_catboost_strategy/submission.csv
@@ -149,7 +167,7 @@ python timeseries_api/run_timeseries_api.py --data-root data --strategy-dir exam
 
 推理严格要求 `time_id` 递增。模型先更新历史时序状态，再预测需要的 responder_hat，最后预测 target。
 
-### 8. 从远程电脑传回结果
+### 9. 从远程电脑传回结果
 
 默认远程仓库为 `ustc-lab:~/xhth`：
 
@@ -163,7 +181,7 @@ examples\responder_assisted_lgb_catboost_strategy\pull_remote_results.bat
 examples\responder_assisted_lgb_catboost_strategy\pull_remote_results.bat HOST REMOTE_REPO
 ```
 
-脚本传回 `model/`、`audit/`、可选的 `analysis/` 和 `submission.csv`，不会传输巨大的 `work/cache` 与 OOF 中间文件。
+脚本传回 `model/`、`model_single_responder/`、`audit/`、`analysis/`、`submission.csv`，并尝试传回普通训练和单 responder 训练的 `oof_models/`、`oof_responder_hat.dat` 与 `cache.json`。巨大的 `work/cache/shard_*` 数组不会传输。
 
 ## 进度显示
 
