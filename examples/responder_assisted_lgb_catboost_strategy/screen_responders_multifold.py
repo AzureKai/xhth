@@ -37,6 +37,10 @@ def parse_args():
     parser.add_argument("--min-positive-folds", type=int, default=3)
     parser.add_argument("--cluster-correlation", type=float, default=0.95)
     parser.add_argument("--refine-count", type=int, default=8)
+    parser.add_argument("--residual-ridge", type=float, default=1.0)
+    parser.add_argument("--hat-clip", type=float, default=5.0)
+    parser.add_argument("--min-scale-ratio", type=float, default=0.25)
+    parser.add_argument("--max-scale-ratio", type=float, default=4.0)
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--early-stopping", type=int, default=20)
     parser.add_argument("--threads", type=int, default=8)
@@ -123,27 +127,69 @@ def ridge_predict(model, x):
 def residual_increment(
     target_cal, baseline_cal, hat_cal, weight_cal,
     target_eval, baseline_eval, hat_eval, weight_eval,
+    residual_ridge, hat_clip, min_scale_ratio, max_scale_ratio,
 ):
     hat_mean = weighted_mean(hat_cal, weight_cal)
-    centered_cal = hat_cal - hat_mean
-    centered_eval = hat_eval - hat_mean
+    centered_cal = np.asarray(hat_cal, dtype=np.float64) - hat_mean
+    centered_eval = np.asarray(hat_eval, dtype=np.float64) - hat_mean
+    calibration_variance = (
+        np.sum(weight_cal * centered_cal * centered_cal)
+        / max(float(np.sum(weight_cal)), 1e-12)
+    )
+    calibration_scale = float(np.sqrt(max(calibration_variance, 1e-12)))
+    evaluation_mean = weighted_mean(hat_eval, weight_eval)
+    evaluation_centered = np.asarray(hat_eval, dtype=np.float64) - evaluation_mean
+    evaluation_variance = (
+        np.sum(weight_eval * evaluation_centered * evaluation_centered)
+        / max(float(np.sum(weight_eval)), 1e-12)
+    )
+    evaluation_scale = float(np.sqrt(max(evaluation_variance, 0.0)))
+    scale_ratio = evaluation_scale / calibration_scale
+    scale_stable = bool(
+        np.isfinite(scale_ratio)
+        and min_scale_ratio <= scale_ratio <= max_scale_ratio
+    )
+    standardized_cal = np.clip(
+        centered_cal / calibration_scale, -hat_clip, hat_clip
+    )
+    standardized_eval = np.clip(
+        centered_eval / calibration_scale, -hat_clip, hat_clip
+    )
     residual_cal = target_cal - baseline_cal
-    denominator = np.sum(weight_cal * centered_cal * centered_cal)
+    denominator = (
+        np.sum(weight_cal * standardized_cal * standardized_cal)
+        + float(residual_ridge) * np.sum(weight_cal)
+    )
     coefficient = (
-        float(np.sum(weight_cal * centered_cal * residual_cal) / denominator)
+        float(
+            np.sum(weight_cal * standardized_cal * residual_cal)
+            / denominator
+        )
         if denominator > 0 else 0.0
     )
     baseline_score = weighted_r2(target_eval, baseline_eval, weight_eval)
     augmented_score = weighted_r2(
-        target_eval, baseline_eval + coefficient * centered_eval, weight_eval
+        target_eval,
+        baseline_eval + coefficient * standardized_eval,
+        weight_eval,
     )
-    return coefficient, baseline_score, augmented_score, augmented_score - baseline_score
+    return {
+        "residual_coefficient": coefficient,
+        "target_baseline_r2": baseline_score,
+        "target_augmented_r2": augmented_score,
+        "target_incremental_r2": augmented_score - baseline_score,
+        "calibration_hat_scale": calibration_scale,
+        "evaluation_hat_scale": evaluation_scale,
+        "hat_scale_ratio": scale_ratio,
+        "scale_stable": scale_stable,
+    }
 
 
 def summarize_fold_rows(rows, responder):
     current = [row for row in rows if row["responder"] == responder]
     deltas = np.asarray([row["target_incremental_r2"] for row in current])
     centered = np.asarray([row["responder_centered_r2"] for row in current])
+    scale_stable = np.asarray([row["scale_stable"] for row in current])
     return {
         "responder": responder,
         "median_centered_r2": float(np.median(centered)),
@@ -154,6 +200,8 @@ def summarize_fold_rows(rows, responder):
         "minimum_delta_r2": float(np.min(deltas)),
         "last_delta_r2": float(deltas[-1]),
         "positive_folds": int(np.sum(deltas > 0)),
+        "stable_scale_folds": int(np.sum(scale_stable)),
+        "last_scale_stable": bool(scale_stable[-1]),
         "robust_score": float(np.median(deltas) - 0.5 * np.std(deltas)),
         "fold_deltas": deltas.tolist(),
         "fold_centered_r2": centered.tolist(),
@@ -226,13 +274,13 @@ def lightgbm_refinement(
             )
             hat_cal = model.predict(x[calibration])
             hat_eval = model.predict(x[evaluation])
-            coefficient, baseline_score, augmented_score, delta = (
-                residual_increment(
-                    target[calibration], baseline_cal, hat_cal,
-                    target_weight[calibration],
-                    target[evaluation], baseline_eval, hat_eval,
-                    target_weight[evaluation],
-                )
+            increment = residual_increment(
+                target[calibration], baseline_cal, hat_cal,
+                target_weight[calibration],
+                target[evaluation], baseline_eval, hat_eval,
+                target_weight[evaluation],
+                args.residual_ridge, args.hat_clip,
+                args.min_scale_ratio, args.max_scale_ratio,
             )
             centered_r2 = weighted_r2(
                 responder[evaluation], hat_eval,
@@ -243,15 +291,14 @@ def lightgbm_refinement(
                     "fold": fold,
                     "responder": name,
                     "responder_centered_r2": centered_r2,
-                    "residual_coefficient": coefficient,
-                    "target_baseline_r2": baseline_score,
-                    "target_augmented_r2": augmented_score,
-                    "target_incremental_r2": delta,
+                    **increment,
                 }
             )
             progress(
                 f"LightGBM refine fold {fold + 1}/{len(folds)} "
-                f"{index}/{len(candidates)} {name}: delta={delta:+.8f}"
+                f"{index}/{len(candidates)} {name}: "
+                f"delta={increment['target_incremental_r2']:+.8f}, "
+                f"scale_ratio={increment['hat_scale_ratio']:.3f}"
             )
     ranking = [
         summarize_fold_rows(fold_rows, responder) for responder in candidates
@@ -283,7 +330,6 @@ def main():
     responder_matrix = np.column_stack(
         [np.nan_to_num(arrays[name], nan=0.0) for name in responders]
     ).astype(np.float32)
-    all_outputs = np.column_stack([target, responder_matrix])
     folds = temporal_fold_slices(
         arrays["time_id"], args.folds, args.warmup_fraction
     )
@@ -298,25 +344,32 @@ def main():
         train = fold_info["train"]
         calibration = fold_info["calibration"]
         evaluation = fold_info["evaluation"]
+        baseline = fit_model(
+            x[train], target[train], target_weight[train],
+            x[calibration], target[calibration],
+            target_weight[calibration], args,
+        )
+        baseline_cal = baseline.predict(x[calibration])
+        baseline_eval = baseline.predict(x[evaluation])
         ridge = fit_multi_output_ridge(
-            x[train], all_outputs[train], target_weight[train],
+            x[train], responder_matrix[train], target_weight[train],
             args.ridge_alpha,
         )
         prediction_cal = ridge_predict(ridge, x[calibration])
         prediction_eval = ridge_predict(ridge, x[evaluation])
-        evaluation_hats.append(prediction_eval[:, 1:])
+        evaluation_hats.append(prediction_eval)
         for column, name in enumerate(responders):
-            coefficient, baseline_score, augmented_score, delta = (
-                residual_increment(
-                    target[calibration], prediction_cal[:, 0],
-                    prediction_cal[:, column + 1], target_weight[calibration],
-                    target[evaluation], prediction_eval[:, 0],
-                    prediction_eval[:, column + 1], target_weight[evaluation],
-                )
+            increment = residual_increment(
+                target[calibration], baseline_cal,
+                prediction_cal[:, column], target_weight[calibration],
+                target[evaluation], baseline_eval,
+                prediction_eval[:, column], target_weight[evaluation],
+                args.residual_ridge, args.hat_clip,
+                args.min_scale_ratio, args.max_scale_ratio,
             )
             centered_r2 = weighted_r2(
                 responder_matrix[evaluation, column],
-                prediction_eval[:, column + 1],
+                prediction_eval[:, column],
                 target_weight[evaluation], centered=True,
             )
             ridge_fold_rows.append(
@@ -326,10 +379,7 @@ def main():
                     "time_end": fold_info["time_end"],
                     "responder": name,
                     "responder_centered_r2": centered_r2,
-                    "residual_coefficient": coefficient,
-                    "target_baseline_r2": baseline_score,
-                    "target_augmented_r2": augmented_score,
-                    "target_incremental_r2": delta,
+                    **increment,
                 }
             )
         progress(
@@ -345,21 +395,50 @@ def main():
         row for row in ridge_ranking
         if row["median_centered_r2"] >= args.min_centered_r2
         and row["positive_folds"] >= args.min_positive_folds
+        and row["stable_scale_folds"] >= args.min_positive_folds
+        and row["last_scale_stable"]
         and row["last_delta_r2"] > 0
         and row["robust_score"] > 0
     ]
     hats = np.vstack(evaluation_hats)
     hat_correlation = np.corrcoef(hats, rowvar=False)
     eligible_names = [row["responder"] for row in eligible]
-    eligible_indices = [responders.index(name) for name in eligible_names]
-    eligible_correlation = (
-        hat_correlation[np.ix_(eligible_indices, eligible_indices)]
-        if eligible_indices else np.empty((0, 0))
+    if eligible:
+        clustering_rows = eligible
+        selection_mode = "strict_increment"
+    else:
+        clustering_rows = [
+            row for row in ridge_ranking
+            if row["median_centered_r2"] >= args.min_centered_r2
+            and row["stable_scale_folds"] >= args.min_positive_folds
+            and row["last_scale_stable"]
+        ]
+        clustering_rows.sort(
+            key=lambda row: row["median_centered_r2"], reverse=True
+        )
+        clustering_rows = clustering_rows[
+            :max(args.refine_count * 2, args.refine_count)
+        ]
+        selection_mode = "predictability_fallback"
+        if not clustering_rows:
+            clustering_rows = [
+                row for row in ridge_ranking
+                if np.isfinite(row["median_centered_r2"])
+                and row["last_scale_stable"]
+            ][:args.refine_count]
+            selection_mode = "scale_stable_fallback"
+    clustering_names = [row["responder"] for row in clustering_rows]
+    clustering_indices = [
+        responders.index(name) for name in clustering_names
+    ]
+    clustering_correlation = (
+        hat_correlation[np.ix_(clustering_indices, clustering_indices)]
+        if clustering_indices else np.empty((0, 0))
     )
     clusters = cluster_candidates(
-        eligible_names, eligible_correlation,
-        args.cluster_correlation, eligible,
-    ) if eligible_names else []
+        clustering_names, clustering_correlation,
+        args.cluster_correlation, clustering_rows,
+    ) if clustering_names else []
     representatives = [
         item["representative"] for item in clusters[:args.refine_count]
     ]
@@ -378,6 +457,8 @@ def main():
         row["responder"] for row in lightgbm_ranking
         if row["median_centered_r2"] >= args.min_centered_r2
         and row["positive_folds"] >= args.min_positive_folds
+        and row["stable_scale_folds"] >= args.min_positive_folds
+        and row["last_scale_stable"]
         and row["last_delta_r2"] > 0
         and row["robust_score"] > 0
     ]
@@ -399,14 +480,28 @@ def main():
         pd.DataFrame(lightgbm_fold_rows).to_csv(
             output_dir / "multifold_lightgbm_folds.csv", index=False
         )
+    else:
+        for stale_name in (
+            "multifold_lightgbm_ranking.csv",
+            "multifold_lightgbm_folds.csv",
+        ):
+            (output_dir / stale_name).unlink(missing_ok=True)
     report = {
-        "method": "expanding_multifold_ridge_cluster_lightgbm",
+        "method": "stable_expanding_multifold_ridge_cluster_lightgbm_v2",
         "total_rows": total_rows,
         "sample_rows": len(x),
         "feature_count": len(features),
         "responder_count": len(responders),
         "folds": len(folds),
+        "safety": {
+            "residual_ridge": args.residual_ridge,
+            "hat_clip": args.hat_clip,
+            "min_scale_ratio": args.min_scale_ratio,
+            "max_scale_ratio": args.max_scale_ratio,
+        },
         "ridge_eligible": eligible_names,
+        "selection_mode": selection_mode,
+        "clustering_pool": clustering_names,
         "clusters": clusters,
         "lightgbm_representatives": representatives,
         "final_candidates": final_candidates,

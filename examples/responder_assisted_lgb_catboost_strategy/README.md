@@ -35,6 +35,8 @@ python -m pip install -r examples/responder_assisted_lgb_catboost_strategy/requi
 python examples/responder_assisted_lgb_catboost_strategy/screen_responders_multifold.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis/multifold_responders --max-rows 300000 --folds 4 --refine-count 8 --threads 8
 ```
 
+筛选器使用 LightGBM 建立 target 基线，Ridge 只负责一次性预测全部 responder。残差融合会按校准段标准化 `responder_hat`、裁剪极端值并加入正则项，同时检查校准段与评估段的预测尺度漂移。严格增量条件没有候选时，只会回退选择尺度稳定且可预测的代表进入 LightGBM 复核，不会直接把它们判为最终候选。安全参数可通过 `--residual-ridge`、`--hat-clip`、`--min-scale-ratio` 和 `--max-scale-ratio` 调整。
+
 每个时间折都按“历史训练→当前块前半段校准残差系数→当前块后半段评估”执行。默认要求 centered R²不低于0.01、至少3/4折 target 增量为正、最后一折为正且稳健分数为正。通过者按 OOF `responder_hat` 绝对相关0.95聚类，每簇只选择一个代表进入轻量 LightGBM 复核。
 
 主要输出：
