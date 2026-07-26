@@ -135,6 +135,14 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite responder --threads 8
 ```
 
+解释 C4 收益来源的配对机制消融：
+
+```powershell
+python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model_c4_mechanism --training-data-mode in-memory --experiment-suite c4-mechanism --skip-existing-models --threads 8
+```
+
+该套件统一运行 A、C4、四个单 responder、四个 leave-one-out 和 `C4_SHUFFLED`。打乱对照在每个 `time_id` 内分别重排 `responder_hat`，保留当期分布但破坏样本对应关系；它只用于诊断，永远不会被选为部署模型。结果写入 `ablation_report.json`，并额外生成 `c4_mechanism_report.json`，其中正的 leave-one-out 数值表示删除该 responder 后 C4 变差。建议复用已有 `work/`，避免重新生成相同的 C4 OOF responder。
+
 对全量筛选结果中的一二梯队12个 responder 运行完整 OOF 单 responder 实验：
 
 ```powershell

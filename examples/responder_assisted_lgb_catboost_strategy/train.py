@@ -77,11 +77,15 @@ def parse_args():
     )
     parser.add_argument(
         "--experiment-suite",
-        choices=["legacy", "next-step", "responder", "single-responder", "all"],
+        choices=[
+            "legacy", "next-step", "responder", "c4-mechanism",
+            "single-responder", "all",
+        ],
         default="next-step",
         help=(
             "legacy runs A/B/C/D; next-step runs the compact target suite; "
-            "responder isolates the default four; single-responder runs one "
+            "responder isolates the default four; c4-mechanism adds leave-one-"
+            "out and within-time shuffled controls; single-responder runs one "
             "full OOF target experiment per screened candidate."
         ),
     )
@@ -553,6 +557,59 @@ def segmented_validation_scores(time_ids, y, pred, weight, parts: int = 4):
     }
 
 
+def c4_mechanism_summary(scores):
+    required = {
+        "A", "C4", "R02", "R03", "R28", "R29",
+        "C4_NO_R02", "C4_NO_R03", "C4_NO_R28", "C4_NO_R29",
+        "C4_SHUFFLED",
+    }
+    if not required.issubset(scores):
+        return None
+
+    def paired_delta(left, right):
+        left_parts = left["segmented_validation"]["parts"]
+        right_parts = right["segmented_validation"]["parts"]
+        return {
+            "overall": float(left["score"] - right["score"]),
+            "segments": [
+                float(a["score"] - b["score"])
+                for a, b in zip(left_parts, right_parts)
+            ],
+        }
+
+    c4 = scores["C4"]
+    baseline = scores["A"]
+    shuffled = scores["C4_SHUFFLED"]
+    member_suffixes = ("R02", "R03", "R28", "R29")
+    return {
+        "interpretation": {
+            "c4_vs_baseline": (
+                "Total value of the four responder_hat features."
+            ),
+            "c4_vs_shuffled": (
+                "Sample-level information beyond within-time distributions."
+            ),
+            "leave_one_out": (
+                "Positive means C4 became worse after removing that responder."
+            ),
+            "single_responder": (
+                "Independent value of each responder_hat versus baseline."
+            ),
+        },
+        "c4_vs_baseline": paired_delta(c4, baseline),
+        "c4_vs_shuffled": paired_delta(c4, shuffled),
+        "shuffled_vs_baseline": paired_delta(shuffled, baseline),
+        "leave_one_out": {
+            suffix: paired_delta(c4, scores[f"C4_NO_{suffix}"])
+            for suffix in member_suffixes
+        },
+        "single_responder": {
+            suffix: paired_delta(scores[suffix], baseline)
+            for suffix in member_suffixes
+        },
+    }
+
+
 TARGET_EXPERIMENTS = {
     "A": {"temporal_groups": (), "responders": ()},
     "B": {"temporal_groups": None, "responders": ()},
@@ -578,6 +635,28 @@ TARGET_EXPERIMENTS = {
     "R29": {
         "temporal_groups": (),
         "responders": ("responder_29",),
+    },
+    "C4_NO_R02": {
+        "temporal_groups": (),
+        "responders": ("responder_03", "responder_28", "responder_29"),
+    },
+    "C4_NO_R03": {
+        "temporal_groups": (),
+        "responders": ("responder_28", "responder_29", "responder_02"),
+    },
+    "C4_NO_R28": {
+        "temporal_groups": (),
+        "responders": ("responder_03", "responder_29", "responder_02"),
+    },
+    "C4_NO_R29": {
+        "temporal_groups": (),
+        "responders": ("responder_03", "responder_28", "responder_02"),
+    },
+    "C4_SHUFFLED": {
+        "temporal_groups": (),
+        "responders": tuple(DEFAULT_RESPONDERS),
+        "shuffle_within_time": True,
+        "deployable": False,
     },
     "C2_R28": {
         "temporal_groups": (),
@@ -645,6 +724,12 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
         names = [
             "A", "R02", "R03", "R28", "R29",
             "C2", "C2_R28", "C2_R29", "C4",
+        ]
+    elif args.experiment_suite == "c4-mechanism":
+        names = [
+            "A", "C4", "R02", "R03", "R28", "R29",
+            "C4_NO_R02", "C4_NO_R03", "C4_NO_R28", "C4_NO_R29",
+            "C4_SHUFFLED",
         ]
     elif args.experiment_suite == "single-responder":
         names = ["A", *(f"S_{name}" for name in responders)]
@@ -722,11 +807,34 @@ def target_experiment_spec(metadata: dict, name: str,
         "responders": responder_names,
         "responder_indices": responder_indices,
         "feature_names": feature_names,
+        "shuffle_within_time": bool(
+            definition.get("shuffle_within_time", False)
+        ),
+        "deployable": bool(definition.get("deployable", True)),
     }
 
 
+def shuffled_within_time(values, time_ids, seed):
+    """Break row correspondence while preserving each time block's values."""
+    shuffled = np.asarray(values, dtype=np.float32).copy()
+    time_ids = np.asarray(time_ids)
+    rng = np.random.default_rng(seed)
+    start = 0
+    while start < len(time_ids):
+        stop = int(np.searchsorted(
+            time_ids, time_ids[start], side="right"
+        ))
+        for column in range(shuffled.shape[1]):
+            shuffled[start:stop, column] = shuffled[
+                start:stop, column
+            ][rng.permutation(stop - start)]
+        start = stop
+    return shuffled
+
+
 def target_experiment_matrices(args, cache_dir, train_segments, valid_segments,
-                               oof_hat, valid_hat, spec):
+                               oof_hat, valid_hat, spec,
+                               train_times=None, valid_times=None):
     responder_indices = spec["responder_indices"]
     train_extra = (
         np.asarray(oof_hat[:, responder_indices], dtype=np.float32)
@@ -736,6 +844,18 @@ def target_experiment_matrices(args, cache_dir, train_segments, valid_segments,
         np.asarray(valid_hat[:, responder_indices], dtype=np.float32)
         if responder_indices else None
     )
+    if spec["shuffle_within_time"]:
+        if train_times is None or valid_times is None:
+            raise ValueError("shuffled experiment requires train and valid times")
+        name_seed = int(hashlib.sha256(
+            spec["name"].encode("utf-8")
+        ).hexdigest()[:8], 16)
+        train_extra = shuffled_within_time(
+            train_extra, train_times, args.seed ^ name_seed
+        )
+        valid_extra = shuffled_within_time(
+            valid_extra, valid_times, args.seed ^ name_seed ^ 0x5A5A5A5A
+        )
     base_indices = np.asarray(spec["base_indices"], dtype=np.int64)
     return (
         training_matrix(
@@ -1029,13 +1149,18 @@ def main():
 
     y_train = vector_for_segments(cache_dir, oof_segments, "target")
     w_train = vector_for_segments(cache_dir, oof_segments, "weight")
-    y_valid = vector_for_segments(cache_dir, valid_segments, "target")
-    valid_times = vector_for_segments(cache_dir, valid_segments, "time")
     variants = requested_target_experiments
     experiment_specs = {
         name: target_experiment_spec(metadata, name, responders)
         for name in variants
     }
+    target_train_times = (
+        vector_for_segments(cache_dir, oof_segments, "time")
+        if any(spec["shuffle_within_time"] for spec in experiment_specs.values())
+        else None
+    )
+    y_valid = vector_for_segments(cache_dir, valid_segments, "target")
+    valid_times = vector_for_segments(cache_dir, valid_segments, "time")
     progress(f"target experiments: {variants}")
     ablation_scores = {}
     importance_frames = []
@@ -1047,7 +1172,7 @@ def main():
         spec = experiment_specs[variant]
         target_train_x, target_valid_x = target_experiment_matrices(
             args, cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
-            spec,
+            spec, target_train_times, valid_times,
         )
         variant_path = model_dir / f"target_{variant}.txt"
         old_spec = (
@@ -1061,6 +1186,8 @@ def main():
             and old_spec
             and old_spec.get("base_indices") == spec["base_indices"]
             and old_spec.get("responders") == spec["responders"]
+            and old_spec.get("shuffle_within_time", False)
+            == spec["shuffle_within_time"]
         )
         if can_load:
             candidate = lgb.Booster(model_file=str(variant_path))
@@ -1109,7 +1236,7 @@ def main():
                 }
             )
         )
-        if score > best_score:
+        if spec["deployable"] and score > best_score:
             best_variant = variant
             best_score = score
             best_target_model = target_model
@@ -1153,11 +1280,20 @@ def main():
     pd.concat(importance_frames, ignore_index=True).to_csv(
         model_dir / "target_feature_importance.csv", index=False
     )
+    mechanism_summary = c4_mechanism_summary(ablation_scores)
+    mechanism_path = model_dir / "c4_mechanism_report.json"
+    if mechanism_summary is not None:
+        mechanism_path.write_text(
+            json.dumps(mechanism_summary, indent=2), encoding="utf-8"
+        )
+    else:
+        mechanism_path.unlink(missing_ok=True)
     (model_dir / "ablation_report.json").write_text(
         json.dumps(
             {"best_variant": best_variant, "scores": ablation_scores,
              "target_experiment_specs": experiment_specs,
-             "responder_diagnostics": responder_diagnostics},
+             "responder_diagnostics": responder_diagnostics,
+             "c4_mechanism": mechanism_summary},
             indent=2,
         ),
         encoding="utf-8",

@@ -36,6 +36,7 @@ if errorlevel 1 exit /b 1
 
 call :copy_optional_dir analysis
 call :copy_optional_dir model_single_responder
+call :copy_optional_dir model_c4_mechanism
 call :copy_optional_file submission.csv
 
 rem OOF artifacts are useful for responder redundancy and combination analysis.
