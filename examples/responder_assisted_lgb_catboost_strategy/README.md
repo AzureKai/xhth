@@ -22,7 +22,7 @@
 推荐 Windows Python 3.12，并在独立虚拟环境中安装依赖：
 
 ```powershell
-python -m pip install -r examples/responder_assisted_lgb_catboost_strategy/requirement.txt
+python3 -m pip install -r examples/responder_assisted_lgb_catboost_strategy/requirement.txt
 ```
 
 ## 推荐工作流
@@ -32,7 +32,7 @@ python -m pip install -r examples/responder_assisted_lgb_catboost_strategy/requi
 推荐先运行4折 expanding-window 多输出 Ridge 筛选、OOF 相关性聚类和轻量 LightGBM 复核：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/screen_responders_multifold.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis/multifold_responders --max-rows 300000 --folds 4 --refine-count 8 --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/screen_responders_multifold.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis/multifold_responders --max-rows 300000 --folds 4 --refine-count 8 --threads 8
 ```
 
 筛选器使用 LightGBM 建立 target 基线，Ridge 只负责一次性预测全部 responder。残差融合会按校准段标准化 `responder_hat`、裁剪极端值并加入正则项，同时检查校准段与评估段的预测尺度漂移。严格增量条件没有候选时，只会回退选择尺度稳定且可预测的代表进入 LightGBM 复核，不会直接把它们判为最终候选。安全参数可通过 `--residual-ridge`、`--hat-clip`、`--min-scale-ratio` 和 `--max-scale-ratio` 调整。
@@ -52,7 +52,7 @@ python examples/responder_assisted_lgb_catboost_strategy/screen_responders_multi
 数据 manifest 当前记录47个 responder。脚本自动从 Parquet schema 发现全部 `responder_*`，不会写死编号。数据按连续时间拆成训练60%、校准20%和最终评估20%，输出 responder 的 centered R²、预测相关性，以及加入 baseline target 残差后的样本外增量。
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/screen_all_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis/all_responders --max-rows 500000 --candidate-count 12 --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/screen_all_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis/all_responders --max-rows 500000 --candidate-count 12 --threads 8
 ```
 
 主要输出：
@@ -65,7 +65,7 @@ python examples/responder_assisted_lgb_catboost_strategy/screen_all_responders.p
 ### 3. 分析 responder 与 target 的直接关系
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis --max-rows 2000000 --time-bins 10
+python3 examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis --max-rows 2000000 --time-bins 10
 ```
 
 输出全局加权相关、去时间均值相关、去资产均值相关、逐时点截面 IC、分段稳定性和综合筛选分数。
@@ -73,7 +73,7 @@ python examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py -
 ### 4. 生成时序特征路由
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/analyze_feature_temporal_types.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
+python3 examples/responder_assisted_lgb_catboost_strategy/analyze_feature_temporal_types.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
 ```
 
 训练脚本默认读取 `analysis/temporal_feature_plan.json`。若文件不存在，则对选中的原始特征使用默认时序变换；默认已排除低价值的 `delta1` 和 `xs_rank_delta1`。
@@ -83,13 +83,13 @@ python examples/responder_assisted_lgb_catboost_strategy/analyze_feature_tempora
 内存充足时推荐一次性装载当前训练和验证区间：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --threads 8
 ```
 
 内存较小时使用磁盘分片外存训练：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode out-of-core --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode out-of-core --threads 8
 ```
 
 两种模式使用完全相同的时间切分、特征和标签。`in-memory` 使用连续 `float32` 矩阵；`out-of-core` 使用缓存分片和 `lightgbm.Sequence`。
@@ -97,13 +97,13 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 断点恢复并跳过兼容的已有模型：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --skip-existing-models --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --skip-existing-models --threads 8
 ```
 
 强制重建缓存：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --rebuild-cache --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --rebuild-cache --threads 8
 ```
 
 ### 6. Target 消融套件
@@ -120,25 +120,25 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 只训练指定实验：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --target-experiments C2,T60,T20_60 --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --target-experiments C2,T60,T20_60 --threads 8
 ```
 
 原始 A/B/C/D 套件：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite legacy --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite legacy --threads 8
 ```
 
 当前四个 responder 的专项消融：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite responder --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --experiment-suite responder --threads 8
 ```
 
 解释 C4 收益来源的配对机制消融：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model_c4_mechanism --training-data-mode in-memory --experiment-suite c4-mechanism --skip-existing-models --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model_c4_mechanism --training-data-mode in-memory --experiment-suite c4-mechanism --skip-existing-models --threads 8
 ```
 
 该套件统一运行 A、C4、四个单 responder、四个 leave-one-out 和 `C4_SHUFFLED`。打乱对照在每个 `time_id` 内分别重排 `responder_hat`，保留当期分布但破坏样本对应关系；它只用于诊断，永远不会被选为部署模型。结果写入 `ablation_report.json`，并额外生成 `c4_mechanism_report.json`，其中正的 leave-one-out 数值表示删除该 responder 后 C4 变差。建议复用已有 `work/`，避免重新生成相同的 C4 OOF responder。
@@ -146,7 +146,7 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 对全量筛选结果中的一二梯队12个 responder 运行完整 OOF 单 responder 实验：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_single_responder --model-dir examples/responder_assisted_lgb_catboost_strategy/model_single_responder --training-data-mode in-memory --experiment-suite single-responder --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_single_responder --model-dir examples/responder_assisted_lgb_catboost_strategy/model_single_responder --training-data-mode in-memory --experiment-suite single-responder --threads 8
 ```
 
 该套件默认使用 `responder_14,09,08,10,22,23,21,42,07,15,41,24`，训练 A 基线以及每个候选单独加入一个 OOF `responder_hat` 的12个 target 模型。建议使用独立的 `work_single_responder/` 和 `model_single_responder/`，避免覆盖当前正式 C4。
@@ -154,7 +154,7 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 也可以显式指定 responder 列表：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_custom_responders --model-dir examples/responder_assisted_lgb_catboost_strategy/model_custom_responders --training-data-mode in-memory --experiment-suite single-responder --responders responder_14,responder_09,responder_22 --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_custom_responders --model-dir examples/responder_assisted_lgb_catboost_strategy/model_custom_responders --training-data-mode in-memory --experiment-suite single-responder --responders responder_14,responder_09,responder_22 --threads 8
 ```
 
 每个实验都会输出整体验证 R²、四个连续验证时间段的 R²、分段标准差、最低分、最佳迭代轮数和特征重要性。整体验证分数最高的模型保存为 `model/target_lightgbm.txt`，精确特征列顺序和 responder 子集写入 `model/metadata.json`。
@@ -164,7 +164,7 @@ python examples/responder_assisted_lgb_catboost_strategy/train.py --data-root da
 必须使用与模型相同的 `work/cache`：
 
 ```powershell
-python examples/responder_assisted_lgb_catboost_strategy/audit_responders.py --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --output-dir examples/responder_assisted_lgb_catboost_strategy/audit
+python3 examples/responder_assisted_lgb_catboost_strategy/audit_responders.py --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --output-dir examples/responder_assisted_lgb_catboost_strategy/audit
 ```
 
 报告中的 `model_cache_compatible` 应为 `true`，cache schema、temporal engine version、plan hash 和特征列必须与模型一致。
@@ -172,7 +172,7 @@ python examples/responder_assisted_lgb_catboost_strategy/audit_responders.py --w
 ### 8. 本地时序推理
 
 ```powershell
-python timeseries_api/run_timeseries_api.py --data-root data --strategy-dir examples/responder_assisted_lgb_catboost_strategy --output examples/responder_assisted_lgb_catboost_strategy/submission.csv
+python3 timeseries_api/run_timeseries_api.py --data-root data --strategy-dir examples/responder_assisted_lgb_catboost_strategy --output examples/responder_assisted_lgb_catboost_strategy/submission.csv
 ```
 
 推理严格要求 `time_id` 递增。模型先更新历史时序状态，再预测需要的 responder_hat，最后预测 target。

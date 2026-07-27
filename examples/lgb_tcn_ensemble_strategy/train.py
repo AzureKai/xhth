@@ -22,6 +22,21 @@ def progress(message):
     print(f"[progress {time.perf_counter() - START:9.1f}s] {message}", flush=True)
 
 
+def progress_bar(label, current, total, detail=""):
+    total = max(int(total), 1)
+    current = min(max(int(current), 0), total)
+    width = 28
+    filled = int(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    suffix = f" | {detail}" if detail else ""
+    print(
+        f"[{label:<22}] [{bar}] {100.0 * current / total:6.2f}% "
+        f"({current:,}/{total:,}) {time.perf_counter() - START:9.1f}s"
+        f"{suffix}",
+        flush=True,
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Causal per-asset TCN and LightGBM prediction ensemble."
@@ -94,6 +109,7 @@ def load_data(files, features):
         frames.append(frame)
         total += len(frame)
         progress(f"loaded parquet {index}/{len(files)}; rows={total:,}")
+        progress_bar("parquet loading", index, len(files), f"rows={total:,}")
     frame = pd.concat(frames, ignore_index=True)
     del frames
     raw = frame.loc[:, features].to_numpy(dtype=np.float32, copy=True)
@@ -210,13 +226,21 @@ def weighted_r2(target, prediction, weight):
     )
 
 
-def predict(model, loader, device, total_rows):
+def predict(model, loader, device, total_rows, label="TCN prediction"):
     model.eval()
     output = np.empty(total_rows, dtype=np.float32)
+    total_batches = max(len(loader), 1)
+    report_every = max(1, total_batches // 20)
     with torch.no_grad():
-        for batch, _, _, positions in loader:
+        for batch_index, (batch, _, _, positions) in enumerate(loader, start=1):
             values = model(batch.to(device)).cpu().numpy()
             output[positions.numpy()] = values
+            if (
+                batch_index == 1
+                or batch_index == total_batches
+                or batch_index % report_every == 0
+            ):
+                progress_bar(label, batch_index, total_batches, "batches")
     return output
 
 
@@ -350,7 +374,11 @@ def main():
         model.train()
         loss_sum = 0.0
         weight_sum = 0.0
-        for batch, labels, weights, _ in train_loader:
+        total_batches = max(len(train_loader), 1)
+        report_every = max(1, total_batches // 20)
+        for batch_index, (batch, labels, weights, _) in enumerate(
+            train_loader, start=1
+        ):
             batch = batch.to(device)
             labels = labels.to(device)
             weights = weights.to(device)
@@ -364,8 +392,20 @@ def main():
             optimizer.step()
             loss_sum += float(loss.detach()) * float(weights.sum())
             weight_sum += float(weights.sum())
+            if (
+                batch_index == 1
+                or batch_index == total_batches
+                or batch_index % report_every == 0
+            ):
+                progress_bar(
+                    f"TCN epoch {epoch}",
+                    batch_index,
+                    total_batches,
+                    f"loss={loss_sum / max(weight_sum, 1e-12):.8f}",
+                )
         cal_prediction = predict(
-            model, calibration_loader, device, len(order)
+            model, calibration_loader, device, len(order),
+            f"calibration epoch {epoch}",
         )[calibration_positions]
         score = weighted_r2(
             target[calibration_positions], cal_prediction,
@@ -391,10 +431,12 @@ def main():
     model.load_state_dict(best_state)
 
     cal_temporal = predict(
-        model, calibration_loader, device, len(order)
+        model, calibration_loader, device, len(order),
+        "final calibration",
     )[calibration_positions]
     eval_temporal = predict(
-        model, evaluation_loader, device, len(order)
+        model, evaluation_loader, device, len(order),
+        "final evaluation",
     )[evaluation_positions]
     base_full_original = np.full(len(order), np.nan, dtype=np.float32)
     base_full_original[original_valid] = np.asarray(base_artifact["prediction"])
