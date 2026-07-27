@@ -9,10 +9,14 @@ from temporal_features import TemporalFeatureBuilder
 
 
 class Model:
-    def __init__(self):
+    def __init__(self, model_dir=None):
         import lightgbm as lgb
 
-        model_dir = Path(__file__).resolve().parent / "model"
+        model_dir = (
+            Path(model_dir)
+            if model_dir is not None
+            else Path(__file__).resolve().parent / "model"
+        )
         self.metadata = json.loads((model_dir / "metadata.json").read_text(encoding="utf-8"))
         self.features = list(self.metadata["feature_columns"])
         self.responders = list(self.metadata["responders"])

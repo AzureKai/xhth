@@ -875,7 +875,11 @@ def main():
     cache_dir = work_dir / "cache"
     model_dir.mkdir(parents=True, exist_ok=True)
     final_files = [model_dir / f"{name}.txt" for name in responders]
-    final_files.extend([model_dir / "target_lightgbm.txt", model_dir / "metadata.json"])
+    final_files.extend([
+        model_dir / "target_lightgbm.txt",
+        model_dir / "metadata.json",
+        model_dir / "validation_predictions.npz",
+    ])
     existing_model_metadata = None
     if (model_dir / "metadata.json").exists():
         existing_model_metadata = json.loads(
@@ -1299,6 +1303,19 @@ def main():
         encoding="utf-8",
     )
     clip_min, clip_max = np.quantile(valid_pred[np.isfinite(valid_pred)], [0.001, 0.999])
+    valid_assets = vector_for_segments(
+        cache_dir, valid_segments, "x", column=-1
+    ).astype(np.int64)
+    np.savez_compressed(
+        model_dir / "validation_predictions.npz",
+        time_id=np.asarray(valid_times, dtype=np.int64),
+        asset_id=valid_assets,
+        target=np.asarray(y_valid, dtype=np.float32),
+        weight=np.asarray(valid_w, dtype=np.float32),
+        prediction=np.asarray(
+            np.clip(valid_pred, clip_min, clip_max), dtype=np.float32
+        ),
+    )
     output = {
         "strategy": "responder_assisted_lgb_catboost_strategy",
         "feature_columns": metadata["feature_columns"], "responders": responders,
