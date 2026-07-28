@@ -59,8 +59,46 @@ def run_stage(label, command, stage, total):
     )
 
 
+def check_torch(device):
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "PyTorch is not installed for this Python interpreter.\n"
+            "CUDA 12.4 install command:\n"
+            "python3 -m pip install torch==2.5.1 "
+            "--index-url https://download.pytorch.org/whl/cu124"
+        ) from exc
+    available = bool(torch.cuda.is_available())
+    compiled_cuda = str(torch.version.cuda or "cpu-only")
+    print(
+        f"[pipeline] PyTorch={torch.__version__}, "
+        f"compiled_cuda={compiled_cuda}, cuda_available={available}",
+        flush=True,
+    )
+    if device == "cuda" and not available:
+        raise SystemExit(
+            "CUDA was explicitly requested but PyTorch cannot initialize it.\n"
+            "This machine reports a CUDA 12.4-capable driver. Reinstall the "
+            "matching official wheel:\n"
+            "python3 -m pip install --force-reinstall torch==2.5.1 "
+            "--index-url https://download.pytorch.org/whl/cu124\n"
+            "Then verify with:\n"
+            "python3 -c \"import torch; print(torch.__version__, "
+            "torch.version.cuda, torch.cuda.is_available())\""
+        )
+    if device == "auto" and not available:
+        print(
+            "[pipeline] warning: CUDA is unavailable; TCN will run on CPU. "
+            "For this CUDA 12.4 driver, install torch==2.5.1 from the cu124 "
+            "wheel index, or pass --device cpu intentionally.",
+            flush=True,
+        )
+
+
 def main():
     args = parse_args()
+    check_torch(args.device)
     root = Path(__file__).resolve().parents[2]
     base_train = (
         root / "examples" / "responder_assisted_lgb_catboost_strategy"

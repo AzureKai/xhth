@@ -283,10 +283,23 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    cuda_available = bool(torch.cuda.is_available())
+    if args.device == "cuda" and not cuda_available:
+        raise RuntimeError(
+            "CUDA was requested but cannot be initialized. Check the NVIDIA "
+            "driver and install a matching PyTorch CUDA wheel."
+        )
+    resolved_device = (
+        "cuda" if args.device == "auto" and cuda_available else args.device
+    )
+    if resolved_device == "auto":
+        resolved_device = "cpu"
+    device = torch.device(resolved_device)
+    progress(
+        f"PyTorch={torch.__version__}, compiled_cuda="
+        f"{torch.version.cuda or 'cpu-only'}, cuda_available={cuda_available}, "
+        f"selected_device={device}"
+    )
     files = manifest_files(args.data_root)
     if not files:
         raise ValueError("no training parquet files")

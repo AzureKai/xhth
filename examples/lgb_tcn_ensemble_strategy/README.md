@@ -2,6 +2,22 @@
 
 该策略使用现有 responder-assisted LightGBM 作为基模型，再训练一个按 `asset_id` 构造历史窗口的轻量因果 TCN。TCN 直接读取历史路径，不依赖预先压缩的 rolling/EMA 特征。
 
+## 环境
+
+远程机驱动支持 CUDA 12.4 时，使用官方匹配版本，避免 `NVIDIA driver is too old` 后静默回退 CPU：
+
+```bash
+python3 -m pip install --force-reinstall torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+```
+
+安装后验证：
+
+```bash
+python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+第三项必须为 `True` 才会使用 GPU。流水线会在 LightGBM 阶段开始前显示 PyTorch 版本、编译 CUDA 版本和 GPU 可用状态。希望 GPU 不可用时立即停止，可把训练命令中的 `--device auto` 改为 `--device cuda`。
+
 训练严格分为：
 
 ```text
