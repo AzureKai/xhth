@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--training-data-mode", default="in-memory")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--feature-count", type=int, default=48)
+    parser.add_argument("--temporal-screen-rows", type=int, default=500_000)
+    parser.add_argument("--target-oof-folds", type=int, default=3)
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--levels", type=int, default=4)
@@ -104,7 +106,20 @@ def main():
         root / "examples" / "responder_assisted_lgb_catboost_strategy"
         / "train.py"
     )
+    temporal_analyzer = (
+        root / "examples" / "responder_assisted_lgb_catboost_strategy"
+        / "analyze_feature_temporal_types.py"
+    )
     tcn_train = Path(__file__).resolve().parent / "train.py"
+    oof_exporter = Path(__file__).resolve().parent / "export_base_oof.py"
+    temporal_output = Path(args.work_dir) / "temporal_analysis"
+    base_oof_output = Path(args.work_dir) / "base_target_oof_predictions.npz"
+    temporal_command = [
+        sys.executable, str(temporal_analyzer),
+        "--data-root", args.data_root,
+        "--output-dir", str(temporal_output),
+        "--max-rows", str(args.temporal_screen_rows),
+    ]
     base_command = [
         sys.executable, str(base_train),
         "--data-root", args.data_root,
@@ -119,6 +134,9 @@ def main():
         sys.executable, str(tcn_train),
         "--data-root", args.data_root,
         "--base-model-dir", args.base_model_dir,
+        "--base-oof-predictions", str(base_oof_output),
+        "--temporal-statistics",
+        str(temporal_output / "feature_temporal_statistics.csv"),
         "--work-dir", args.work_dir,
         "--model-dir", args.model_dir,
         "--feature-count", str(args.feature_count),
@@ -128,10 +146,20 @@ def main():
         "--batch-size", str(args.batch_size),
         "--device", args.device,
     ]
+    oof_command = [
+        sys.executable, str(oof_exporter),
+        "--base-work-dir", args.base_work_dir,
+        "--base-model-dir", args.base_model_dir,
+        "--output", str(base_oof_output),
+        "--folds", str(args.target_oof_folds),
+        "--threads", str(args.threads),
+    ]
     if args.max_train_rows:
         tcn_command.extend(["--max-train-rows", str(args.max_train_rows)])
-    run_stage("LightGBM validation export", base_command, 1, 2)
-    run_stage("TCN training and ensemble evaluation", tcn_command, 2, 2)
+    run_stage("temporal feature screening", temporal_command, 1, 4)
+    run_stage("LightGBM validation export", base_command, 2, 4)
+    run_stage("strict target OOF export", oof_command, 3, 4)
+    run_stage("TCN residual training and evaluation", tcn_command, 4, 4)
     print("[pipeline] all training stages complete", flush=True)
 
 

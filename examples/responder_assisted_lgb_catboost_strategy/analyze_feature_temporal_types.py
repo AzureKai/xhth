@@ -80,7 +80,8 @@ def percentile(series):
 
 def analyze(frame, features):
     rows = []
-    for feature in features:
+    report_every = max(1, len(features) // 20)
+    for feature_index, feature in enumerate(features, start=1):
         asset_metrics = []
         for _, group in frame[["asset_id", "time_id", feature]].groupby("asset_id", sort=False):
             x = group[feature].to_numpy(dtype=np.float64)
@@ -115,6 +116,16 @@ def analyze(frame, features):
             )
         values = np.nanmean(np.asarray(asset_metrics, dtype=np.float64), axis=0)
         rows.append([feature, *values])
+        if (
+            feature_index == 1
+            or feature_index == len(features)
+            or feature_index % report_every == 0
+        ):
+            print(
+                f"[temporal screening] {feature_index}/{len(features)} "
+                f"({100.0 * feature_index / len(features):.1f}%) {feature}",
+                flush=True,
+            )
 
     result = pd.DataFrame(rows, columns=[
         "feature", "level_acf1", "level_acf5", "level_acf20", "delta_acf1",

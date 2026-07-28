@@ -41,7 +41,11 @@ class Model:
         self.mean = np.asarray(metadata["feature_mean"], dtype=np.float32)
         self.scale = np.asarray(metadata["feature_scale"], dtype=np.float32)
         self.sequence_length = int(metadata["sequence_length"])
-        self.alpha = float(metadata["fusion_weight"])
+        self.tcn_target = str(metadata.get("tcn_target", "direct_target"))
+        self.base_intercept = float(metadata.get("base_intercept", 0.0))
+        self.base_scale = float(metadata.get("base_scale", 1.0))
+        self.residual_weight = float(metadata.get("residual_weight", 0.0))
+        self.legacy_fusion_weight = float(metadata.get("fusion_weight", 0.0))
         self.tcn = torch.jit.load(
             str(model_dir / metadata["tcn_model"]), map_location="cpu"
         ).eval()
@@ -70,4 +74,10 @@ class Model:
             batch[row, -1, -length:] = 1.0
         with torch.no_grad():
             temporal = self.tcn(torch.from_numpy(batch)).numpy()
-        return base_prediction + self.alpha * (temporal - base_prediction)
+        if self.tcn_target == "direct_target":
+            return (
+                base_prediction
+                + self.legacy_fusion_weight * (temporal - base_prediction)
+            )
+        calibrated_base = self.base_intercept + self.base_scale * base_prediction
+        return calibrated_base + self.residual_weight * temporal

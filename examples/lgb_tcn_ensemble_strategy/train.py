@@ -45,7 +45,8 @@ def parse_args():
     parser.add_argument("--base-model-dir", required=True)
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--feature-importance", default="")
+    parser.add_argument("--base-oof-predictions", required=True)
+    parser.add_argument("--temporal-statistics", required=True)
     parser.add_argument("--feature-count", type=int, default=48)
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--hidden-size", type=int, default=64)
@@ -59,7 +60,9 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-train-rows", type=int, default=0)
-    parser.add_argument("--max-fusion-weight", type=float, default=0.5)
+    parser.add_argument("--max-residual-weight", type=float, default=0.25)
+    parser.add_argument("--min-base-scale", type=float, default=0.5)
+    parser.add_argument("--max-base-scale", type=float, default=1.5)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default="auto"
@@ -78,26 +81,39 @@ def manifest_files(root):
     return sorted((root / "train").glob("*.parquet"))
 
 
-def select_features(files, importance_path, count):
+def select_features(files, statistics_path, count):
     available = [
         name for name in pq.read_schema(files[0]).names
         if name.startswith("feature_")
     ]
-    if importance_path and Path(importance_path).exists():
-        frame = pd.read_csv(importance_path)
-        frame = frame[frame["feature"].isin(available)]
-        ranking = (
-            frame.groupby("feature", as_index=False)["importance_gain"]
-            .sum()
-            .sort_values("importance_gain", ascending=False)["feature"]
-            .tolist()
-        )
-        selected = ranking[:count]
-    else:
-        selected = available[:count]
+    frame = pd.read_csv(statistics_path)
+    frame = frame[frame["feature"].isin(available)].copy()
+    dynamic_columns = [
+        "trend_score", "difference_score", "volatility_score",
+        "shock_score", "mean_reversion_score",
+    ]
+    missing = [name for name in dynamic_columns if name not in frame]
+    if missing:
+        raise ValueError(f"temporal statistics missing columns: {missing}")
+    scores = frame[dynamic_columns].to_numpy(dtype=np.float64)
+    sorted_scores = np.sort(scores, axis=1)
+    persistence = np.nanmax(
+        np.abs(frame[[
+            "level_acf1", "level_acf5", "level_acf20",
+            "delta_acf1", "abs_delta_acf1", "squared_delta_acf1",
+        ]].to_numpy(dtype=np.float64)),
+        axis=1,
+    )
+    frame["tcn_sequence_score"] = (
+        0.55 * sorted_scores[:, -1]
+        + 0.25 * sorted_scores[:, -2]
+        + 0.20 * np.clip(persistence, 0.0, 1.0)
+    )
+    frame = frame.sort_values("tcn_sequence_score", ascending=False)
+    selected = frame["feature"].head(count).tolist()
     if not selected:
         raise ValueError("no usable feature columns")
-    return selected
+    return selected, frame
 
 
 def load_data(files, features):
@@ -261,13 +277,29 @@ def segmented_scores(times, target, prediction, weight, parts=4):
     return result
 
 
-def fusion_weight(target, base, temporal, weight, maximum):
-    direction = temporal - base
-    denominator = np.sum(weight * direction * direction)
+def calibrate_base(target, prediction, weight, minimum_scale, maximum_scale):
+    weight_sum = max(float(np.sum(weight)), 1e-12)
+    pred_mean = float(np.sum(weight * prediction) / weight_sum)
+    target_mean = float(np.sum(weight * target) / weight_sum)
+    centered = prediction - pred_mean
+    denominator = float(np.sum(weight * centered * centered))
+    scale = (
+        float(np.sum(weight * centered * (target - target_mean)) / denominator)
+        if denominator > 0 else 1.0
+    )
+    scale = float(np.clip(scale, minimum_scale, maximum_scale))
+    intercept = target_mean - scale * pred_mean
+    return intercept, scale
+
+
+def residual_weight(target, base, residual_prediction, weight, maximum):
+    denominator = np.sum(weight * residual_prediction * residual_prediction)
     if denominator <= 0:
         return 0.0
-    alpha = np.sum(weight * direction * (target - base)) / denominator
-    return float(np.clip(alpha, 0.0, maximum))
+    beta = np.sum(
+        weight * residual_prediction * (target - base)
+    ) / denominator
+    return float(np.clip(beta, 0.0, maximum))
 
 
 def shuffled_within_time(values, times, seed):
@@ -308,20 +340,33 @@ def main():
         (base_dir / "metadata.json").read_text(encoding="utf-8")
     )
     base_artifact = np.load(base_dir / "validation_predictions.npz")
-    importance_path = args.feature_importance or str(
-        base_dir / "target_feature_importance.csv"
+    base_oof_artifact = np.load(args.base_oof_predictions)
+    features, feature_ranking = select_features(
+        files, args.temporal_statistics, args.feature_count
     )
-    features = select_features(files, importance_path, args.feature_count)
     progress(f"selected {len(features)} sequence features; device={device}")
     data = load_data(files, features)
     cutoff = int(base_metadata["valid_cutoff_time_id"])
     original_valid = data["time"] >= cutoff
+    oof_times = np.asarray(base_oof_artifact["time_id"])
+    oof_mask = (
+        (data["time"] >= int(oof_times[0]))
+        & (data["time"] <= int(oof_times[-1]))
+    )
     for name in ("time_id", "asset_id"):
         expected = data["time" if name == "time_id" else "asset"][original_valid]
         actual = np.asarray(base_artifact[name])
         if not np.array_equal(expected, actual):
             raise ValueError(
                 f"base validation artifact {name} does not align with parquet rows"
+            )
+        expected_oof = data[
+            "time" if name == "time_id" else "asset"
+        ][oof_mask]
+        actual_oof = np.asarray(base_oof_artifact[name])
+        if not np.array_equal(expected_oof, actual_oof):
+            raise ValueError(
+                f"base OOF artifact {name} does not align with parquet rows"
             )
 
     order = np.lexsort((data["time"], data["asset"]))
@@ -348,20 +393,50 @@ def main():
     valid_times = np.unique(times[~train_mask])
     midpoint = len(valid_times) // 2
     calibration_end = int(valid_times[midpoint])
-    train_positions = np.flatnonzero(train_mask)
-    if args.max_train_rows and len(train_positions) > args.max_train_rows:
-        rng = np.random.default_rng(args.seed)
-        train_positions = np.sort(rng.choice(
-            train_positions, args.max_train_rows, replace=False
-        ))
     calibration_positions = np.flatnonzero(
         (times >= cutoff) & (times < calibration_end)
     )
     evaluation_positions = np.flatnonzero(times >= calibration_end)
 
+    oof_prediction_original = np.full(len(order), np.nan, dtype=np.float32)
+    oof_prediction_original[oof_mask] = np.asarray(
+        base_oof_artifact["prediction"], dtype=np.float32
+    )
+    oof_prediction = oof_prediction_original[order]
+    oof_valid = np.isfinite(oof_prediction)
+    base_intercept, base_scale = calibrate_base(
+        target[oof_valid], oof_prediction[oof_valid], weight[oof_valid],
+        args.min_base_scale, args.max_base_scale,
+    )
+    calibrated_oof = base_intercept + base_scale * oof_prediction
+
+    base_full_original = np.full(len(order), np.nan, dtype=np.float32)
+    base_full_original[original_valid] = np.asarray(base_artifact["prediction"])
+    base_sorted = base_full_original[order]
+    calibrated_base = base_intercept + base_scale * base_sorted
+    residual_target = np.zeros(len(order), dtype=np.float32)
+    residual_target[oof_valid] = (
+        target[oof_valid] - calibrated_oof[oof_valid]
+    )
+    valid_base = np.isfinite(calibrated_base)
+    residual_target[valid_base] = (
+        target[valid_base] - calibrated_base[valid_base]
+    )
+    train_positions = np.flatnonzero(oof_valid)
+    if args.max_train_rows and len(train_positions) > args.max_train_rows:
+        rng = np.random.default_rng(args.seed)
+        train_positions = np.sort(rng.choice(
+            train_positions, args.max_train_rows, replace=False
+        ))
+    progress(
+        f"base calibration from {int(oof_valid.sum()):,} OOF rows: "
+        f"intercept={base_intercept:+.8f}, scale={base_scale:.6f}; "
+        f"TCN residual train_rows={len(train_positions):,}"
+    )
+
     def loader(positions, shuffle):
         dataset = AssetSequenceDataset(
-            normalized, target, weight, asset_start,
+            normalized, residual_target, weight, asset_start,
             positions, args.sequence_length,
         )
         return DataLoader(
@@ -420,14 +495,23 @@ def main():
             model, calibration_loader, device, len(order),
             f"calibration epoch {epoch}",
         )[calibration_positions]
+        epoch_beta = residual_weight(
+            target[calibration_positions],
+            calibrated_base[calibration_positions],
+            cal_prediction,
+            weight[calibration_positions],
+            args.max_residual_weight,
+        )
         score = weighted_r2(
-            target[calibration_positions], cal_prediction,
+            target[calibration_positions],
+            calibrated_base[calibration_positions] + epoch_beta * cal_prediction,
             weight[calibration_positions],
         )
         progress(
             f"epoch {epoch}/{args.epochs}: "
             f"loss={loss_sum / max(weight_sum, 1e-12):.8f}, "
-            f"calibration_r2={score:.8f}"
+            f"residual_weight={epoch_beta:.6f}, "
+            f"calibrated_base_plus_residual_r2={score:.8f}"
         )
         if score > best_score:
             best_score = score
@@ -451,28 +535,27 @@ def main():
         model, evaluation_loader, device, len(order),
         "final evaluation",
     )[evaluation_positions]
-    base_full_original = np.full(len(order), np.nan, dtype=np.float32)
-    base_full_original[original_valid] = np.asarray(base_artifact["prediction"])
-    base_sorted = base_full_original[order]
     cal_base = base_sorted[calibration_positions]
     eval_base = base_sorted[evaluation_positions]
-    alpha = fusion_weight(
-        target[calibration_positions], cal_base, cal_temporal,
-        weight[calibration_positions], args.max_fusion_weight,
+    cal_calibrated_base = calibrated_base[calibration_positions]
+    eval_calibrated_base = calibrated_base[evaluation_positions]
+    beta = residual_weight(
+        target[calibration_positions], cal_calibrated_base, cal_temporal,
+        weight[calibration_positions], args.max_residual_weight,
     )
-    eval_ensemble = eval_base + alpha * (eval_temporal - eval_base)
+    eval_ensemble = eval_calibrated_base + beta * eval_temporal
     shuffled_cal = shuffled_within_time(
         cal_temporal, times[calibration_positions], args.seed + 101
     )
     shuffled_eval = shuffled_within_time(
         eval_temporal, times[evaluation_positions], args.seed + 103
     )
-    shuffled_alpha = fusion_weight(
-        target[calibration_positions], cal_base, shuffled_cal,
-        weight[calibration_positions], args.max_fusion_weight,
+    shuffled_beta = residual_weight(
+        target[calibration_positions], cal_calibrated_base, shuffled_cal,
+        weight[calibration_positions], args.max_residual_weight,
     )
     shuffled_ensemble = (
-        eval_base + shuffled_alpha * (shuffled_eval - eval_base)
+        eval_calibrated_base + shuffled_beta * shuffled_eval
     )
     report = {
         "base_model_dir": str(base_dir.resolve()),
@@ -485,17 +568,30 @@ def main():
         "evaluation_time": [
             calibration_end, int(times[evaluation_positions[-1]])
         ],
-        "temporal_calibration_r2": best_score,
-        "fusion_weight": alpha,
-        "shuffled_fusion_weight": shuffled_alpha,
+        "feature_selection": {
+            "source": str(Path(args.temporal_statistics).resolve()),
+            "method": "dynamic_scores_plus_persistence",
+        },
+        "base_calibration": {
+            "source_rows": int(oof_valid.sum()),
+            "intercept": base_intercept,
+            "scale": base_scale,
+        },
+        "calibrated_base_plus_residual_calibration_r2": best_score,
+        "residual_weight": beta,
+        "shuffled_residual_weight": shuffled_beta,
         "evaluation": {
             "base_r2": weighted_r2(
                 target[evaluation_positions], eval_base,
                 weight[evaluation_positions],
             ),
-            "temporal_r2": weighted_r2(
-                target[evaluation_positions], eval_temporal,
+            "calibrated_base_r2": weighted_r2(
+                target[evaluation_positions], eval_calibrated_base,
                 weight[evaluation_positions],
+            ),
+            "residual_prediction_r2": weighted_r2(
+                target[evaluation_positions] - eval_calibrated_base,
+                eval_temporal, weight[evaluation_positions],
             ),
             "ensemble_r2": weighted_r2(
                 target[evaluation_positions], eval_ensemble,
@@ -505,12 +601,20 @@ def main():
                 target[evaluation_positions], shuffled_ensemble,
                 weight[evaluation_positions],
             ),
-            "prediction_correlation": float(np.corrcoef(
+            "base_residual_prediction_correlation": float(np.corrcoef(
                 eval_base, eval_temporal
+            )[0, 1]),
+            "residual_target_prediction_correlation": float(np.corrcoef(
+                target[evaluation_positions] - eval_calibrated_base,
+                eval_temporal,
             )[0, 1]),
             "base_segments": segmented_scores(
                 times[evaluation_positions], target[evaluation_positions],
                 eval_base, weight[evaluation_positions],
+            ),
+            "calibrated_base_segments": segmented_scores(
+                times[evaluation_positions], target[evaluation_positions],
+                eval_calibrated_base, weight[evaluation_positions],
             ),
             "ensemble_segments": segmented_scores(
                 times[evaluation_positions], target[evaluation_positions],
@@ -520,10 +624,14 @@ def main():
     }
     report["evaluation"]["ensemble_delta"] = (
         report["evaluation"]["ensemble_r2"]
-        - report["evaluation"]["base_r2"]
+        - report["evaluation"]["calibrated_base_r2"]
     )
     report["evaluation"]["shuffled_delta"] = (
         report["evaluation"]["shuffled_ensemble_r2"]
+        - report["evaluation"]["calibrated_base_r2"]
+    )
+    report["evaluation"]["base_calibration_delta"] = (
+        report["evaluation"]["calibrated_base_r2"]
         - report["evaluation"]["base_r2"]
     )
     model_dir = Path(args.model_dir)
@@ -532,6 +640,9 @@ def main():
     work_dir.mkdir(parents=True, exist_ok=True)
     scripted = torch.jit.script(model.cpu().eval())
     scripted.save(str(model_dir / "tcn.pt"))
+    feature_ranking.to_csv(
+        model_dir / "tcn_feature_screening.csv", index=False
+    )
     metadata = {
         "strategy": "lgb_tcn_ensemble_strategy",
         "base_strategy_dir": "../responder_assisted_lgb_catboost_strategy",
@@ -542,7 +653,10 @@ def main():
         "feature_mean": mean.tolist(),
         "feature_scale": scale.tolist(),
         "sequence_length": args.sequence_length,
-        "fusion_weight": alpha,
+        "base_intercept": base_intercept,
+        "base_scale": base_scale,
+        "residual_weight": beta,
+        "tcn_target": "calibrated_lgb_residual",
         "tcn_model": "tcn.pt",
     }
     (model_dir / "metadata.json").write_text(
@@ -558,12 +672,14 @@ def main():
         target=target[evaluation_positions],
         weight=weight[evaluation_positions],
         base=eval_base,
-        temporal=eval_temporal,
+        calibrated_base=eval_calibrated_base,
+        temporal_residual=eval_temporal,
         ensemble=eval_ensemble,
         shuffled_ensemble=shuffled_ensemble,
     )
     progress(
-        f"complete: base={report['evaluation']['base_r2']:.8f}, "
+        f"complete: calibrated_base="
+        f"{report['evaluation']['calibrated_base_r2']:.8f}, "
         f"ensemble={report['evaluation']['ensemble_r2']:.8f}, "
         f"delta={report['evaluation']['ensemble_delta']:+.8f}"
     )
