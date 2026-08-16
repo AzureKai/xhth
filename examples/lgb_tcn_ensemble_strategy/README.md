@@ -1,5 +1,7 @@
 # LightGBM + TCN 时序集成
 
+> 当前暂停：实验主线先强化纯 LightGBM 的训练协议与模型骨架。本目录保留作后续残差时序实验，现阶段不建议启动新的 TCN 训练。
+
 该策略使用现有 responder-assisted LightGBM 作为基模型，再训练一个按 `asset_id` 构造历史窗口的轻量因果 TCN。TCN 直接读取历史路径，不依赖预先压缩的 rolling/EMA 特征。
 
 当前版本执行四个严格按时间运行的阶段：

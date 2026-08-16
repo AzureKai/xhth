@@ -54,7 +54,14 @@ class Model:
             feature_names=self.temporal_features,
             recipes=self.temporal_recipes or None,
         )
-        self.target_model = lgb.Booster(model_file=str(model_dir / self.metadata["target_model"]))
+        target_model_files = self.metadata.get("target_models") or [
+            self.metadata["target_model"]
+        ]
+        self.target_models = [
+            lgb.Booster(model_file=str(model_dir / filename))
+            for filename in target_model_files
+        ]
+        self.target_model = self.target_models[0]
         self.target_variant = str(self.metadata.get("target_variant", "D"))
         self.base_feature_count = (
             len(self.features)
@@ -114,11 +121,12 @@ class Model:
         expected_target_features = (
             len(self.target_base_indices) + len(self.target_responders)
         )
-        if self.target_model.num_feature() != expected_target_features:
-            raise ValueError(
-                f"target model expects {self.target_model.num_feature()} features, "
-                f"but metadata defines {expected_target_features}"
-            )
+        for model in self.target_models:
+            if model.num_feature() != expected_target_features:
+                raise ValueError(
+                    f"target model expects {model.num_feature()} features, "
+                    f"but metadata defines {expected_target_features}"
+                )
         self.scale = float(self.metadata.get("prediction_scale", 1.0))
         self.clip_min = float(self.metadata.get("clip_min", -np.inf))
         self.clip_max = float(self.metadata.get("clip_max", np.inf))
@@ -150,6 +158,12 @@ class Model:
         target_x = np.hstack(
             [base[:, self.target_base_indices], responder_hat]
         )
-        prediction = np.asarray(self.target_model.predict(target_x), dtype=np.float64) * self.scale
+        prediction = np.mean(
+            [
+                np.asarray(model.predict(target_x), dtype=np.float64)
+                for model in self.target_models
+            ],
+            axis=0,
+        ) * self.scale
         prediction = np.nan_to_num(prediction, nan=0.0, posinf=0.0, neginf=0.0)
         return np.clip(prediction, self.clip_min, self.clip_max)

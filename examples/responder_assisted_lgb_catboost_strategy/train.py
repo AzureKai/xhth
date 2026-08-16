@@ -26,6 +26,7 @@ TIER_RESPONDERS = [
     "responder_07", "responder_15", "responder_41", "responder_24",
 ]
 TEMPORAL_ENGINE_VERSION = 3
+LGB_PROFILE_VERSION = "low_risk_v1"
 
 
 def parse_args():
@@ -33,8 +34,9 @@ def parse_args():
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--valid-time-fraction", type=float, default=0.2)
-    parser.add_argument("--oof-folds", type=int, default=4)
+    parser.add_argument("--valid-time-fraction", type=float, default=0.15)
+    parser.add_argument("--oof-folds", type=int, default=5)
+    parser.add_argument("--purge-steps", type=int, default=30)
     parser.add_argument("--warmup-fraction", type=float, default=0.25)
     parser.add_argument("--shard-rows", type=int, default=250_000)
     parser.add_argument("--temporal-feature-count", type=int, default=30)
@@ -99,6 +101,10 @@ def parse_args():
     )
     parser.add_argument("--early-stopping", type=int, default=60)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--target-seeds", default="2026,2027,2028",
+        help="Comma-separated seeds for the final full-data target ensemble.",
+    )
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument(
         "--skip-existing-models",
@@ -429,6 +435,54 @@ class ShardSequence(lgb.Sequence):
         value = int(index)
         if value < 0:
             value += len(self)
+        if value < 0 or value >= len(self):
+            raise IndexError(value)
+        return self._rows(value, value + 1)[0]
+
+
+class ConcatenatedSequence(lgb.Sequence):
+    """Present several matrices or Sequences as one LightGBM Sequence."""
+
+    batch_size = 8192
+
+    def __init__(self, *sources):
+        self.sources = [source for source in sources if len(source)]
+        if not self.sources:
+            raise ValueError("cannot concatenate empty training sources")
+        self.lengths = [len(source) for source in self.sources]
+        self.offsets = np.cumsum([0, *self.lengths]).tolist()
+
+    def __len__(self):
+        return self.offsets[-1]
+
+    def _rows(self, start: int, stop: int):
+        if start >= stop:
+            feature_count = int(self.sources[0][0:1].shape[1])
+            return np.empty((0, feature_count), dtype=np.float64)
+        parts = []
+        while start < stop:
+            source_index = bisect_right(self.offsets, start) - 1
+            local = start - self.offsets[source_index]
+            count = min(stop - start, self.lengths[source_index] - local)
+            parts.append(np.asarray(
+                self.sources[source_index][local:local + count],
+                dtype=np.float64,
+            ))
+            start += count
+        return parts[0] if len(parts) == 1 else np.vstack(parts)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            data = self._rows(start, stop)
+            return data if step == 1 else data[::step]
+        if isinstance(index, (list, np.ndarray)):
+            return np.vstack([self[int(item)] for item in index])
+        value = int(index)
+        if value < 0:
+            value += len(self)
+        if value < 0 or value >= len(self):
+            raise IndexError(value)
         return self._rows(value, value + 1)[0]
 
 
@@ -463,6 +517,18 @@ def training_matrix(args, cache_dir: Path, segments, extra=None,
     return ShardSequence(cache_dir, segments, extra, base_indices)
 
 
+def concatenate_training_matrices(args, *sources):
+    if args.training_data_mode == "in-memory":
+        matrix = np.ascontiguousarray(np.vstack(sources), dtype=np.float32)
+        progress(
+            f"materialized refit matrix: rows={matrix.shape[0]:,}, "
+            f"features={matrix.shape[1]:,}, "
+            f"memory={matrix.nbytes / 1024 ** 3:.2f} GiB"
+        )
+        return matrix
+    return ConcatenatedSequence(*sources)
+
+
 def vector_for_segments(cache_dir: Path, segments, suffix: str, column: int | None = None):
     parts = []
     for shard_id, start, end in segments:
@@ -484,16 +550,36 @@ def predict_sequence(model, sequence, label: str = "prediction") -> np.ndarray:
     return output
 
 
-def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight,
-              rounds, args, progress_label="LightGBM"):
-    params = {
+def low_risk_lgb_params(args, seed=None):
+    seed = int(args.seed if seed is None else seed)
+    return {
         "objective": "regression", "metric": "l2", "learning_rate": 0.03,
-        "num_leaves": 64, "min_data_in_leaf": 500, "feature_fraction": 0.8,
-        "bagging_fraction": 0.8, "bagging_freq": 1, "lambda_l2": 5.0,
-        "num_threads": args.threads, "seed": args.seed, "verbosity": -1,
+        "boosting_type": "gbdt", "data_sample_strategy": "bagging",
+        "num_leaves": 63, "max_depth": 12, "min_data_in_leaf": 3500,
+        "feature_fraction": 0.9, "feature_fraction_bynode": 0.9,
+        "bagging_fraction": 0.85, "bagging_freq": 1,
+        "lambda_l1": 1.0, "lambda_l2": 15.0, "path_smooth": 100.0,
+        "max_bin": 255, "deterministic": True, "force_col_wise": True,
+        "num_threads": args.threads, "seed": seed,
+        "bagging_seed": seed, "feature_fraction_seed": seed,
+        "extra_seed": seed, "data_random_seed": int(args.seed),
+        "verbosity": -1,
     }
-    train_set = lgb.Dataset(sequence, label=label, weight=weight, free_raw_data=False)
-    valid_set = lgb.Dataset(valid_sequence, label=valid_label, weight=valid_weight, reference=train_set, free_raw_data=False)
+
+
+def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight,
+              rounds, args, progress_label="LightGBM", categorical_feature=None):
+    params = low_risk_lgb_params(args)
+    categorical_feature = categorical_feature or "auto"
+    train_set = lgb.Dataset(
+        sequence, label=label, weight=weight,
+        categorical_feature=categorical_feature, free_raw_data=False,
+    )
+    valid_set = lgb.Dataset(
+        valid_sequence, label=valid_label, weight=valid_weight,
+        categorical_feature=categorical_feature,
+        reference=train_set, free_raw_data=False,
+    )
     return lgb.train(params, train_set, num_boost_round=rounds, valid_sets=[valid_set],
                      callbacks=[
                          lgb.early_stopping(args.early_stopping),
@@ -503,14 +589,14 @@ def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight
 
 
 def train_lgb_fixed(sequence, label, weight, rounds, args,
-                    progress_label="LightGBM"):
-    params = {
-        "objective": "regression", "metric": "l2", "learning_rate": 0.03,
-        "num_leaves": 64, "min_data_in_leaf": 500, "feature_fraction": 0.8,
-        "bagging_fraction": 0.8, "bagging_freq": 1, "lambda_l2": 5.0,
-        "num_threads": args.threads, "seed": args.seed, "verbosity": -1,
-    }
-    train_set = lgb.Dataset(sequence, label=label, weight=weight, free_raw_data=False)
+                    progress_label="LightGBM", categorical_feature=None,
+                    seed=None):
+    params = low_risk_lgb_params(args, seed=seed)
+    train_set = lgb.Dataset(
+        sequence, label=label, weight=weight,
+        categorical_feature=categorical_feature or "auto",
+        free_raw_data=False,
+    )
     return lgb.train(params, train_set, num_boost_round=max(1, int(rounds)),
                      callbacks=[
                          lightgbm_progress(progress_label, max(1, int(rounds))),
@@ -708,6 +794,18 @@ def configured_responders(args) -> list[str]:
     return values
 
 
+def configured_target_seeds(args) -> list[int]:
+    values = [
+        int(value.strip()) for value in args.target_seeds.split(",")
+        if value.strip()
+    ]
+    if not values:
+        raise ValueError("--target-seeds must contain at least one integer")
+    if len(values) != len(set(values)):
+        raise ValueError(f"duplicate target seeds: {values}")
+    return values
+
+
 def selected_experiments(args, responders: list[str]) -> list[str]:
     if args.ablation_mode != "all":
         return [args.ablation_mode]
@@ -870,6 +968,7 @@ def target_experiment_matrices(args, cache_dir, train_segments, valid_segments,
 def main():
     args = parse_args()
     responders = configured_responders(args)
+    target_seeds = configured_target_seeds(args)
     requested_target_experiments = selected_experiments(args, responders)
     data_root, work_dir, model_dir = Path(args.data_root), Path(args.work_dir), Path(args.model_dir)
     cache_dir = work_dir / "cache"
@@ -877,6 +976,7 @@ def main():
     final_files = [model_dir / f"{name}.txt" for name in responders]
     final_files.extend([
         model_dir / "target_lightgbm.txt",
+        *(model_dir / f"target_final_seed{seed}.txt" for seed in target_seeds),
         model_dir / "metadata.json",
         model_dir / "validation_predictions.npz",
     ])
@@ -894,6 +994,16 @@ def main():
     requested_plan_hash = temporal_config_hash(
         requested_plan_path, requested_importance_path, args.temporal_feature_count
     )
+    requested_training_config = {
+        "valid_time_fraction": args.valid_time_fraction,
+        "oof_folds": args.oof_folds,
+        "warmup_fraction": args.warmup_fraction,
+        "purge_steps": args.purge_steps,
+        "responder_rounds": args.responder_rounds,
+        "target_rounds": args.target_rounds,
+        "early_stopping": args.early_stopping,
+        "seed": args.seed,
+    }
     model_metadata_matches = bool(
         existing_model_metadata
         and existing_model_metadata.get("temporal_recipes")
@@ -901,6 +1011,13 @@ def main():
         == TEMPORAL_ENGINE_VERSION
         and existing_model_metadata.get("temporal_plan_hash", "") == requested_plan_hash
         and existing_model_metadata.get("responders") == responders
+        and existing_model_metadata.get("lgb_profile_version")
+        == LGB_PROFILE_VERSION
+        and existing_model_metadata.get("target_seeds") == target_seeds
+        and int(existing_model_metadata.get("purge_steps", -1))
+        == args.purge_steps
+        and existing_model_metadata.get("training_config")
+        == requested_training_config
     )
     target_suite_matches = bool(
         existing_model_metadata
@@ -967,6 +1084,10 @@ def main():
     valid_count = max(1, int(round(len(times) * args.valid_time_fraction)))
     valid_cutoff = int(times[-valid_count])
     train_times = times[times < valid_cutoff]
+    if args.purge_steps < 0 or args.purge_steps >= len(train_times):
+        raise ValueError(
+            f"purge_steps must be in [0, {len(train_times) - 1}]"
+        )
     warmup_index = max(1, int(len(train_times) * args.warmup_fraction))
     oof_boundaries = np.linspace(warmup_index, len(train_times), args.oof_folds + 1, dtype=int)
     progress(
@@ -1000,6 +1121,11 @@ def main():
         "valid_cutoff": valid_cutoff,
         "oof_folds": args.oof_folds,
         "warmup_fraction": args.warmup_fraction,
+        "purge_steps": args.purge_steps,
+        "lgb_profile_version": LGB_PROFILE_VERSION,
+        "seed": args.seed,
+        "responder_rounds": args.responder_rounds,
+        "early_stopping": args.early_stopping,
     }
     oof_signature = hashlib.sha256(
         json.dumps(oof_signature_payload, sort_keys=True).encode("utf-8")
@@ -1022,7 +1148,9 @@ def main():
     for fold in range(args.oof_folds):
         fold_start = int(train_times[oof_boundaries[fold]])
         fold_end = valid_cutoff if fold == args.oof_folds - 1 else int(train_times[oof_boundaries[fold + 1]])
-        fit_segments = segments_for_range(cache_dir, metadata, None, fold_start)
+        fit_stop_index = max(1, int(oof_boundaries[fold]) - args.purge_steps)
+        fit_end = int(train_times[fit_stop_index])
+        fit_segments = segments_for_range(cache_dir, metadata, None, fit_end)
         pred_segments = segments_for_range(cache_dir, metadata, fold_start, fold_end)
         fit_x = training_matrix(args, cache_dir, fit_segments)
         pred_x = training_matrix(args, cache_dir, pred_segments)
@@ -1032,7 +1160,8 @@ def main():
         responders_pred = vector_for_segments(cache_dir, pred_segments, "responder")
         progress(
             f"OOF fold {fold + 1}/{args.oof_folds}: train_rows={len(fit_x):,}, "
-            f"predict_rows={len(pred_x):,}, time_id={fold_start}..{fold_end - 1}"
+            f"predict_rows={len(pred_x):,}, purge_steps={args.purge_steps}, "
+            f"time_id={fold_start}..{fold_end - 1}"
         )
         for column, name in enumerate(responders):
             fold_model_path = oof_model_dir / f"fold_{fold:02d}_{name}.txt"
@@ -1047,7 +1176,9 @@ def main():
                 model = train_lgb(fit_x, responders_fit[:, column], fit_w, pred_x,
                                   responders_pred[:, column], pred_w,
                                   args.responder_rounds, args,
-                                  f"OOF {fold + 1} {name}")
+                                  f"OOF {fold + 1} {name}",
+                                  categorical_feature=[len(metadata["feature_columns"])
+                                      + len(metadata["temporal_feature_columns"])])
                 model.save_model(str(fold_model_path))
                 progress(f"saved OOF model: {fold_model_path.name}")
             oof_hat[oof_cursor:oof_cursor + len(pred_x), column] = predict_sequence(
@@ -1102,7 +1233,13 @@ def main():
         progress(f"OOF fold {fold + 1}/{args.oof_folds} complete")
 
     valid_segments = segments_for_range(cache_dir, metadata, valid_cutoff, None)
-    train_segments = segments_for_range(cache_dir, metadata, None, valid_cutoff)
+    target_train_upper = (
+        int(train_times[-args.purge_steps])
+        if args.purge_steps > 0 else valid_cutoff
+    )
+    train_segments = segments_for_range(
+        cache_dir, metadata, None, target_train_upper
+    )
     train_x = training_matrix(args, cache_dir, train_segments)
     valid_x = training_matrix(args, cache_dir, valid_segments)
     train_w = vector_for_segments(cache_dir, train_segments, "weight")
@@ -1110,24 +1247,30 @@ def main():
     train_responders = vector_for_segments(cache_dir, train_segments, "responder")
     valid_hat = np.empty((len(valid_x), len(responders)), dtype=np.float32)
     responder_files = {}
+    selection_responder_dir = (
+        work_dir / "selection_responder_models" / oof_signature[:16]
+    )
+    selection_responder_dir.mkdir(parents=True, exist_ok=True)
     for column, name in enumerate(responders):
         final_rounds = int(np.median(responder_best_iterations[name]))
         filename = f"{name}.txt"
-        model_path = model_dir / filename
-        if args.skip_existing_models and model_metadata_matches and model_path.exists():
-            progress(f"loading existing final responder model: {filename}")
+        model_path = selection_responder_dir / filename
+        if args.skip_existing_models and model_path.exists():
+            progress(f"loading existing selection responder model: {filename}")
             model = lgb.Booster(model_file=str(model_path))
         else:
             progress(
-                f"training final responder {column + 1}/{len(responders)}: "
+                f"training selection responder {column + 1}/{len(responders)}: "
                 f"{name}, rounds={final_rounds}, rows={len(train_x):,}"
             )
             model = train_lgb_fixed(
                 train_x, train_responders[:, column], train_w, final_rounds,
-                args, f"final {name}",
+                args, f"selection {name}",
+                categorical_feature=[len(metadata["feature_columns"])
+                    + len(metadata["temporal_feature_columns"])],
             )
             model.save_model(str(model_path))
-            progress(f"saved final responder model: {filename}")
+            progress(f"saved selection responder model: {model_path}")
         valid_hat[:, column] = predict_sequence(model, valid_x, f"validation {name}")
         valid_true = vector_for_segments(cache_dir, valid_segments, "responder", column)
         responder_diagnostics[name]["valid_score"] = weighted_r2(
@@ -1144,22 +1287,30 @@ def main():
         )
         responder_files[name] = filename
         progress_bar(
-            "final responders", column + 1, len(responders), name
+            "selection responders", column + 1, len(responders), name
         )
 
     if args.training_data_mode == "in-memory":
         del train_x, valid_x, train_responders
         gc.collect()
 
-    y_train = vector_for_segments(cache_dir, oof_segments, "target")
-    w_train = vector_for_segments(cache_dir, oof_segments, "weight")
+    target_train_segments = segments_for_range(
+        cache_dir, metadata, int(train_times[warmup_index]),
+        target_train_upper,
+    )
+    target_train_rows = sum(
+        end - start for _, start, end in target_train_segments
+    )
+    target_oof_hat = oof_hat[:target_train_rows]
+    y_train = vector_for_segments(cache_dir, target_train_segments, "target")
+    w_train = vector_for_segments(cache_dir, target_train_segments, "weight")
     variants = requested_target_experiments
     experiment_specs = {
         name: target_experiment_spec(metadata, name, responders)
         for name in variants
     }
     target_train_times = (
-        vector_for_segments(cache_dir, oof_segments, "time")
+        vector_for_segments(cache_dir, target_train_segments, "time")
         if any(spec["shuffle_within_time"] for spec in experiment_specs.values())
         else None
     )
@@ -1175,7 +1326,8 @@ def main():
     for variant in variants:
         spec = experiment_specs[variant]
         target_train_x, target_valid_x = target_experiment_matrices(
-            args, cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
+            args, cache_dir, target_train_segments, valid_segments,
+            target_oof_hat, valid_hat,
             spec, target_train_times, valid_times,
         )
         variant_path = model_dir / f"target_{variant}.txt"
@@ -1211,6 +1363,7 @@ def main():
                 target_train_x, y_train, w_train, target_valid_x,
                 y_valid, valid_w, args.target_rounds, args,
                 f"target {variant}",
+                categorical_feature=[spec["feature_names"].index("asset_id")],
             )
             target_model.save_model(str(variant_path))
         prediction = predict_sequence(target_model, target_valid_x, f"target {variant} validation")
@@ -1276,11 +1429,113 @@ def main():
 
     if best_variant is None or best_target_model is None:
         raise RuntimeError("no target experiment was trained")
-    target_model = best_target_model
     valid_pred = best_valid_prediction
     best_spec = experiment_specs[best_variant]
-    target_path = model_dir / "target_lightgbm.txt"
-    target_model.save_model(str(target_path))
+    best_rounds = int(ablation_scores[best_variant]["best_iteration"])
+
+    progress(
+        f"refitting selected target {best_variant} with validation labels: "
+        f"rounds={best_rounds}, seeds={target_seeds}"
+    )
+    refit_oof_x, refit_valid_x = target_experiment_matrices(
+        args, cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
+        best_spec,
+    )
+    target_refit_x = concatenate_training_matrices(
+        args, refit_oof_x, refit_valid_x
+    )
+    target_refit_y = np.concatenate([
+        vector_for_segments(cache_dir, oof_segments, "target"), y_valid
+    ])
+    target_refit_w = np.concatenate([
+        vector_for_segments(cache_dir, oof_segments, "weight"), valid_w
+    ])
+    target_refit_rows = len(target_refit_y)
+    target_model_files = []
+    for model_index, seed in enumerate(target_seeds, start=1):
+        filename = f"target_final_seed{seed}.txt"
+        target_seed_path = model_dir / filename
+        can_load = bool(
+            args.skip_existing_models
+            and model_metadata_matches
+            and target_seed_path.exists()
+            and existing_model_metadata.get("target_variant") == best_variant
+            and existing_model_metadata.get("target_feature_columns")
+            == best_spec["feature_names"]
+        )
+        if can_load:
+            target_model = lgb.Booster(model_file=str(target_seed_path))
+            can_load = (
+                target_model.num_feature() == len(best_spec["feature_names"])
+            )
+        if can_load:
+            progress(f"loading existing final target model: {filename}")
+        else:
+            progress(
+                f"training final target {model_index}/{len(target_seeds)}: "
+                f"seed={seed}, rows={len(target_refit_x):,}"
+            )
+            target_model = train_lgb_fixed(
+                target_refit_x, target_refit_y, target_refit_w,
+                best_rounds, args, f"final target seed={seed}",
+                categorical_feature=[
+                    best_spec["feature_names"].index("asset_id")
+                ],
+                seed=seed,
+            )
+            target_model.save_model(str(target_seed_path))
+        target_model_files.append(filename)
+        progress_bar(
+            "final target ensemble", model_index, len(target_seeds),
+            f"seed={seed}",
+        )
+    # Keep the historical filename as an alias for older tooling.
+    target_model = lgb.Booster(
+        model_file=str(model_dir / target_model_files[0])
+    )
+    target_model.save_model(str(model_dir / "target_lightgbm.txt"))
+    del target_refit_y, target_refit_w
+    if args.training_data_mode == "in-memory":
+        del refit_oof_x, refit_valid_x, target_refit_x
+        gc.collect()
+
+    progress("refitting deployment responder models on every available row")
+    all_segments = segments_for_range(cache_dir, metadata, None, None)
+    all_x = training_matrix(args, cache_dir, all_segments)
+    all_w = vector_for_segments(cache_dir, all_segments, "weight")
+    all_responders = vector_for_segments(cache_dir, all_segments, "responder")
+    asset_categorical = [
+        len(metadata["feature_columns"])
+        + len(metadata["temporal_feature_columns"])
+    ]
+    for column, name in enumerate(responders):
+        filename = responder_files[name]
+        model_path = model_dir / filename
+        final_rounds = int(np.median(responder_best_iterations[name]))
+        can_load = bool(
+            args.skip_existing_models
+            and model_metadata_matches
+            and model_path.exists()
+        )
+        if can_load:
+            progress(f"loading existing deployment responder model: {filename}")
+        else:
+            progress(
+                f"training deployment responder {column + 1}/{len(responders)}: "
+                f"{name}, rounds={final_rounds}, rows={len(all_x):,}"
+            )
+            model = train_lgb_fixed(
+                all_x, all_responders[:, column], all_w, final_rounds,
+                args, f"deployment {name}",
+                categorical_feature=asset_categorical,
+            )
+            model.save_model(str(model_path))
+        progress_bar(
+            "deployment responders", column + 1, len(responders), name
+        )
+    if args.training_data_mode == "in-memory":
+        del all_x
+        gc.collect()
     pd.concat(importance_frames, ignore_index=True).to_csv(
         model_dir / "target_feature_importance.csv", index=False
     )
@@ -1324,7 +1579,10 @@ def main():
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
         "temporal_feature_columns": metadata["temporal_feature_columns"],
         "temporal_plan_hash": metadata.get("temporal_plan_hash", ""),
-        "responder_models": responder_files, "target_model": "target_lightgbm.txt",
+        "responder_models": responder_files,
+        "target_model": "target_lightgbm.txt",
+        "target_models": target_model_files,
+        "target_seeds": target_seeds,
         "target_variant": best_variant,
         "target_base_indices": best_spec["base_indices"],
         "target_responders": best_spec["responders"],
@@ -1337,7 +1595,13 @@ def main():
         "target_feature_importance": "target_feature_importance.csv",
         "ablation_report": "ablation_report.json",
         "valid_cutoff_time_id": valid_cutoff, "oof_folds": args.oof_folds,
+        "purge_steps": args.purge_steps,
+        "lgb_profile_version": LGB_PROFILE_VERSION,
+        "lgb_params": low_risk_lgb_params(args),
+        "categorical_features": ["asset_id"],
+        "training_config": requested_training_config,
         "warmup_fraction": args.warmup_fraction, "target_train_rows": len(y_train),
+        "target_refit_rows": target_refit_rows,
         "responder_best_iterations": {
             name: int(np.median(values)) for name, values in responder_best_iterations.items()
         },

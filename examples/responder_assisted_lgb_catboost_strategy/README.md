@@ -94,6 +94,16 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 
 两种模式使用完全相同的时间切分、特征和标签。`in-memory` 使用连续 `float32` 矩阵；`out-of-core` 使用缓存分片和 `lightgbm.Sequence`。
 
+当前默认启用强化版 LightGBM 训练协议：
+
+- 将 `asset_id` 作为 categorical feature，而不是普通连续数值。
+- 使用 15% 末端验证集、5 折 expanding-window OOF，并在每个训练/预测边界加入 30 个观测时点的 purge。
+- 使用 63 叶、深度 12、大叶节点、L1/L2、`path_smooth` 和行列采样组成的强正则参数组。
+- 先在无泄漏验证集选定 target 变体和轮数，再把 OOF 区间与末端验证标签合并，以 2026/2027/2028 三个种子重训 target；推理取三模型均值。
+- 用于验证的 responder 模型保存在 `work/selection_responder_models/`，与最终使用全部数据重训的部署 responder 模型严格分离。
+
+可通过 `--purge-steps`、`--target-seeds`、`--valid-time-fraction` 和 `--oof-folds` 覆盖这些默认值。新参数组依赖 LightGBM 4.6.x。
+
 断点恢复并跳过兼容的已有模型：
 
 ```powershell
@@ -157,7 +167,7 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_custom_responders --model-dir examples/responder_assisted_lgb_catboost_strategy/model_custom_responders --training-data-mode in-memory --experiment-suite single-responder --responders responder_14,responder_09,responder_22 --threads 8
 ```
 
-每个实验都会输出整体验证 R²、四个连续验证时间段的 R²、分段标准差、最低分、最佳迭代轮数和特征重要性。整体验证分数最高的模型保存为 `model/target_lightgbm.txt`，精确特征列顺序和 responder 子集写入 `model/metadata.json`。
+每个实验都会输出整体验证 R²、四个连续验证时间段的 R²、分段标准差、最低分、最佳迭代轮数和特征重要性。验证分数最高的可部署变体决定最终特征集合和轮数；三种子最终模型保存为 `model/target_final_seed*.txt`，`model/target_lightgbm.txt` 保留为首个种子的兼容别名。精确特征列顺序、responder 子集和模型列表写入 `model/metadata.json`。
 
 ### 7. 审计 responder
 
@@ -210,6 +220,7 @@ examples\responder_assisted_lgb_catboost_strategy\pull_remote_results.bat HOST R
 
 - 真实 responder 只存在于训练数据，推理时只能使用 responder 模型预测值。
 - OOF responder 必须严格按时间 expanding-window 生成，不能用同一训练样本的拟合值训练 target。
+- `metadata.json` 中的 `valid_score` 来自重训前的选型模型；最终三种子模型已经吸收末端验证标签，因此不能再把该区间当作最终模型的独立验证集。
 - 时序特征只能使用当前 `time_id` 之前的历史状态。
 - 不要设置 `predict_disable_shape_check=true` 绕过维度错误；应检查 metadata 和模型列顺序。
 - 不要把 `work/`、`model/`、Parquet、NumPy 缓存或虚拟环境提交到 Git。
