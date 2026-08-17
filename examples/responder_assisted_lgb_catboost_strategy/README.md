@@ -104,12 +104,16 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 当前默认启用强化版 LightGBM 训练协议：
 
 - 将 `asset_id` 作为 categorical feature，而不是普通连续数值。
-- 使用 15% 末端验证集、5 折 expanding-window OOF，并在每个训练/预测边界加入 30 个观测时点的 purge。
-- 使用 63 叶、深度 12、大叶节点、L1/L2、`path_smooth` 和行列采样组成的强正则参数组。
-- 先在无泄漏验证集选定 target 变体和轮数，再把 OOF 区间与末端验证标签合并，以 2026/2027/2028 三个种子重训 target；推理取三模型均值。
+- 保留最后 15% 时间作为 terminal holdout；前 85% 内部使用 expanding-window OOF，并在每个边界加入 30 个观测时点的 purge。
+- 每个 OOF 验证折和 terminal holdout 都从空时序状态启动，严格模拟测试 API 冷启动。默认 5 期历史计划只需重建会话前 5 个 `time_id`。
+- 先在 `LGB468` 上比较 `smoothed/reference/guarded` 三个预注册 LightGBM 参数组，再用胜出参数对所有 target 变体做 walk-forward 比较；参数和变体均按多折平均分选择，而不是按 terminal holdout 排名。
+- target 晋级同时要求 OOF、holdout 和预测尺度合理；复杂变体还必须在平均折、至少 80% 可评估折、最新折和 holdout 上击败更简单的父模型。默认套件在 CV 冻结后只让 CV 冠军及其必要父模型进入 terminal holdout；专项诊断套件才会评估全部变体。
+- 预测裁剪边界只用 OOF 预测拟合，并且只有 OOF 与 holdout 都不变差时才在部署中启用。报告同时保存原始、裁剪和最终部署分数。
+- 选型结束后把 OOF 区间与 terminal holdout 标签合并，以 2026/2027/2028 三个种子重训 target；推理取三模型均值。
 - 用于验证的 responder 模型保存在 `work/selection_responder_models/`，与最终使用全部数据重训的部署 responder 模型严格分离。
+- 缓存绑定输入 Parquet 的路径、大小和修改时间；输入变化会自动重建。缓存同时对最早 500,000 行生成 `feature_health.json`，审计低有限值比例和常数特征，但默认不自动删列。
 
-可通过 `--purge-steps`、`--target-seeds`、`--valid-time-fraction` 和 `--oof-folds` 覆盖这些默认值。新参数组依赖 LightGBM 4.6.x。
+可通过 `--purge-steps`、`--target-seeds`、`--valid-time-fraction`、`--oof-folds`、`--target-param-candidates` 和 `--feature-health-rows` 覆盖这些默认值。至少需要 3 个 responder OOF 折，默认 5 折会提供 4 个可用于 target 选型的时间折。新参数组依赖 LightGBM 4.6.x。
 
 断点恢复并跳过兼容的已有模型：
 
@@ -132,7 +136,7 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 - `LGB468`：baseline 的 468 列特征，不加入 responder_hat。
 - `LGB468_C4`：baseline 的 468 列特征加四个 OOF responder_hat，共 472 列。
 
-这一组构成 2×2 对照，可分别判断 baseline 时序特征和 responder stacking 的独立增量及联合效果。验证分数最高的可部署实验仍会用于最终三种子重训。
+这一组构成 2×2 对照，可分别判断 baseline 时序特征和 responder stacking 的独立增量及联合效果。变体首先按 development walk-forward 平均分排序，然后经过 terminal holdout 晋级门槛；holdout 不直接用于挑选最高分。
 
 只训练指定实验：
 
@@ -174,7 +178,7 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_custom_responders --model-dir examples/responder_assisted_lgb_catboost_strategy/model_custom_responders --training-data-mode in-memory --experiment-suite single-responder --responders responder_14,responder_09,responder_22 --threads 8
 ```
 
-每个实验都会输出整体验证 R²、四个连续验证时间段的 R²、分段标准差、最低分、最佳迭代轮数和特征重要性。验证分数最高的可部署变体决定最终特征集合和轮数；三种子最终模型保存为 `model/target_final_seed*.txt`，`model/target_lightgbm.txt` 保留为首个种子的兼容别名。精确特征列顺序、responder 子集和模型列表写入 `model/metadata.json`。
+每个实验都会输出多折分数、OOF 汇总分、terminal holdout 原始/裁剪分数、预测缩放诊断、晋级门槛、最佳迭代轮数和特征重要性。通过门槛且 walk-forward 平均分最高的变体决定最终特征集合和轮数；若所有变体都未通过，报告会明确警告并回退到 CV 冠军。三种子最终模型保存为 `model/target_final_seed*.txt`，`model/target_lightgbm.txt` 保留为首个种子的兼容别名。精确特征列顺序、responder 子集和模型列表写入 `model/metadata.json`。
 
 ### 7. 审计 responder
 

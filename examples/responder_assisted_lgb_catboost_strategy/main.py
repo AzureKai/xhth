@@ -128,8 +128,17 @@ class Model:
                     f"but metadata defines {expected_target_features}"
                 )
         self.scale = float(self.metadata.get("prediction_scale", 1.0))
-        self.clip_min = float(self.metadata.get("clip_min", -np.inf))
-        self.clip_max = float(self.metadata.get("clip_max", np.inf))
+        self.clipping_enabled = bool(
+            self.metadata.get("clipping_enabled", True)
+        )
+        self.clip_min = (
+            float(self.metadata.get("clip_min", -np.inf))
+            if self.clipping_enabled else -np.inf
+        )
+        self.clip_max = (
+            float(self.metadata.get("clip_max", np.inf))
+            if self.clipping_enabled else np.inf
+        )
         self.last_time_id: int | None = None
 
     def predict(self, test):

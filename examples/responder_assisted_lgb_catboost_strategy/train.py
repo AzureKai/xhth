@@ -26,10 +26,34 @@ TIER_RESPONDERS = [
     "responder_07", "responder_15", "responder_41", "responder_24",
 ]
 TEMPORAL_ENGINE_VERSION = 4
-LGB_PROFILE_VERSION = "low_risk_v1"
+CACHE_SCHEMA_VERSION = 7
+LGB_PROFILE_VERSION = "walk_forward_v2"
 DEFAULT_TEMPORAL_PLAN_PATH = (
     Path(__file__).resolve().parent / "baseline_468_feature_plan.json"
 )
+TARGET_PARAM_PROFILES = {
+    "smoothed": {
+        "num_leaves": 63, "max_depth": 12, "min_data_in_leaf": 3500,
+        "feature_fraction": 0.9, "feature_fraction_bynode": 0.9,
+        "bagging_fraction": 0.85, "lambda_l1": 1.0,
+        "lambda_l2": 15.0, "path_smooth": 100.0,
+        "regularization_rank": 2,
+    },
+    "reference": {
+        "num_leaves": 63, "max_depth": -1, "min_data_in_leaf": 2000,
+        "feature_fraction": 0.8, "feature_fraction_bynode": 1.0,
+        "bagging_fraction": 0.8, "lambda_l1": 0.0,
+        "lambda_l2": 10.0, "path_smooth": 0.0,
+        "regularization_rank": 0,
+    },
+    "guarded": {
+        "num_leaves": 95, "max_depth": 14, "min_data_in_leaf": 5000,
+        "feature_fraction": 0.9, "feature_fraction_bynode": 0.9,
+        "bagging_fraction": 0.8, "lambda_l1": 1.0,
+        "lambda_l2": 20.0, "path_smooth": 100.0,
+        "regularization_rank": 2,
+    },
+}
 
 
 def parse_args():
@@ -42,6 +66,10 @@ def parse_args():
     parser.add_argument("--purge-steps", type=int, default=30)
     parser.add_argument("--warmup-fraction", type=float, default=0.25)
     parser.add_argument("--shard-rows", type=int, default=250_000)
+    parser.add_argument(
+        "--feature-health-rows", type=int, default=500_000,
+        help="Chronological prefix rows used for the raw-feature health audit.",
+    )
     parser.add_argument("--temporal-feature-count", type=int, default=48)
     parser.add_argument(
         "--feature-importance",
@@ -69,6 +97,11 @@ def parse_args():
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--responder-rounds", type=int, default=500)
     parser.add_argument("--target-rounds", type=int, default=1200)
+    parser.add_argument(
+        "--target-param-candidates",
+        default="smoothed,reference,guarded",
+        help="Comma-separated pre-registered target LightGBM profiles.",
+    )
     parser.add_argument(
         "--responders",
         default="",
@@ -179,6 +212,17 @@ def manifest_files(root: Path) -> list[Path]:
     return sorted((root / "train").glob("*.parquet"))
 
 
+def input_file_fingerprints(files: list[Path]) -> list[dict]:
+    return [
+        {
+            "path": str(path.resolve()),
+            "size": int(path.stat().st_size),
+            "mtime_ns": int(path.stat().st_mtime_ns),
+        }
+        for path in files
+    ]
+
+
 def iter_time_frames(files: list[Path], columns: list[str], batch_size: int):
     import pandas as pd
     import pyarrow.parquet as pq
@@ -280,7 +324,8 @@ def select_temporal_plan(features: list[str], count: int, importance_path: Path 
 
 def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: int,
                 temporal_feature_count: int, importance_path: Path | None,
-                plan_path: Path | None, responders: list[str]):
+                plan_path: Path | None, responders: list[str],
+                feature_health_rows: int):
     import pyarrow.parquet as pq
 
     files = manifest_files(data_root)
@@ -288,6 +333,7 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         raise ValueError("no training parquet files")
     columns = list(pq.read_schema(files[0]).names)
     expected_rows = sum(pq.ParquetFile(path).metadata.num_rows for path in files)
+    fingerprints = input_file_fingerprints(files)
     features = [name for name in columns if name.startswith("feature_")]
     missing = [
         name for name in ["target", "weight", *responders]
@@ -314,6 +360,11 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
     buffers: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     buffered_rows = 0
     shards = []
+    health_limit = max(0, int(feature_health_rows))
+    health_seen = 0
+    health_finite = np.zeros(len(features), dtype=np.int64)
+    health_min = np.full(len(features), np.inf, dtype=np.float64)
+    health_max = np.full(len(features), -np.inf, dtype=np.float64)
 
     def flush():
         nonlocal buffers, buffered_rows
@@ -345,6 +396,17 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
 
     for _, frame in iter_time_frames(files, read_columns, batch_size):
         raw = frame.loc[:, features].to_numpy(dtype=np.float32, copy=True)
+        if health_seen < health_limit:
+            audit_rows = min(len(raw), health_limit - health_seen)
+            audit = np.asarray(raw[:audit_rows], dtype=np.float64)
+            finite = np.isfinite(audit)
+            health_finite += finite.sum(axis=0)
+            if audit_rows:
+                safe_min = np.min(np.where(finite, audit, np.inf), axis=0)
+                safe_max = np.max(np.where(finite, audit, -np.inf), axis=0)
+                health_min = np.minimum(health_min, safe_min)
+                health_max = np.maximum(health_max, safe_max)
+            health_seen += audit_rows
         asset_values = frame["asset_id"].to_numpy(dtype=np.int64)
         temporal = temporal_builder.transform(asset_values, raw[:, temporal_indices])
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
@@ -359,8 +421,42 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         if buffered_rows >= shard_rows:
             flush()
     flush()
+    feature_health = []
+    for index, feature in enumerate(features):
+        finite_ratio = (
+            float(health_finite[index] / health_seen) if health_seen else 0.0
+        )
+        finite_min = float(health_min[index]) if np.isfinite(health_min[index]) else None
+        finite_max = float(health_max[index]) if np.isfinite(health_max[index]) else None
+        constant = bool(
+            finite_min is not None and finite_max is not None
+            and finite_min == finite_max
+        )
+        feature_health.append(
+            {
+                "feature": feature,
+                "finite_ratio": finite_ratio,
+                "finite_min": finite_min,
+                "finite_max": finite_max,
+                "constant": constant,
+                "usable": bool(finite_ratio >= 0.01 and not constant),
+            }
+        )
+    health_report = {
+        "prefix_rows": int(health_seen),
+        "minimum_finite_ratio": 0.01,
+        "features": feature_health,
+        "unhealthy_features": [
+            item["feature"] for item in feature_health if not item["usable"]
+        ],
+        "policy": "audit_only_schema_is_frozen",
+    }
+    (cache_dir / "feature_health.json").write_text(
+        json.dumps(health_report, indent=2), encoding="utf-8"
+    )
     metadata = {
-        "cache_schema_version": 6,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "input_files": fingerprints,
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
         "temporal_plan_hash": temporal_config_hash(
             plan_path, importance_path, temporal_feature_count
@@ -370,6 +466,9 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
         "temporal_recipes": temporal_recipes,
         "temporal_feature_columns": temporal_column_names(temporal_features, temporal_recipes),
         "responders": responders,
+        "feature_health_report": "feature_health.json",
+        "feature_health_rows": int(health_seen),
+        "unhealthy_features": health_report["unhealthy_features"],
         "shards": shards,
     }
     (cache_dir / "cache.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -398,17 +497,106 @@ def segments_for_range(cache_dir: Path, metadata: dict, lower: int | None, upper
     return segments
 
 
+def prefix_segments(segments, rows: int):
+    output = []
+    remaining = int(rows)
+    for shard_id, start, end in segments:
+        if remaining <= 0:
+            break
+        count = min(end - start, remaining)
+        output.append((shard_id, start, start + count))
+        remaining -= count
+    if remaining:
+        raise ValueError("session prefix exceeds available segments")
+    return output
+
+
+def temporal_session_warmup(recipes: dict[str, list[str]]) -> int:
+    transforms = {
+        transform for values in recipes.values() for transform in values
+    }
+    if transforms.intersection({
+        "ema5", "ema20", "ema60", "minus_ema20", "minus_ema60"
+    }):
+        # EMA state retains a decaying dependency on the session origin, so an
+        # exact cold-start simulation must rebuild the complete session.
+        return -1
+    lookbacks = {
+        "lag1": 1, "diff1": 1, "delta1": 1, "xs_rank_delta1": 1,
+        "lag5": 5, "delta5": 5, "ema5": 5, "rmean5": 5,
+        "lag20": 20, "delta20": 20, "ema20": 20,
+        "minus_ema20": 20, "rolling_std20": 20,
+        "historical_zscore20": 20,
+        "ema60": 60, "minus_ema60": 60, "rolling_std60": 60,
+        "historical_zscore60": 60,
+    }
+    return max(
+        (lookbacks.get(transform, 1) for transform in transforms),
+        default=0,
+    )
+
+
+def build_cold_start_prefix(cache_dir: Path, metadata: dict, segments):
+    """Rebuild the beginning of a validation session from an empty history."""
+    warmup = temporal_session_warmup(metadata.get("temporal_recipes", {}))
+    if warmup == 0 or not metadata.get("temporal_feature_columns"):
+        return None
+    times = vector_for_segments(cache_dir, segments, "time")
+    unique_times = np.unique(times)
+    if not len(unique_times):
+        return None
+    warmup_times = unique_times if warmup < 0 else unique_times[:warmup]
+    prefix_rows = int(np.searchsorted(times, warmup_times[-1], side="right"))
+    selected_segments = prefix_segments(segments, prefix_rows)
+    base = np.ascontiguousarray(
+        np.vstack([
+            np.asarray(load_array(cache_dir, shard_id, "x")[start:end], dtype=np.float32)
+            for shard_id, start, end in selected_segments
+        ])
+    )
+    raw_count = len(metadata["feature_columns"])
+    temporal_count = len(metadata["temporal_feature_columns"])
+    temporal_features = list(metadata["temporal_features"])
+    temporal_indices = [
+        metadata["feature_columns"].index(name) for name in temporal_features
+    ]
+    builder = TemporalFeatureBuilder(
+        len(temporal_features), feature_names=temporal_features,
+        recipes=metadata["temporal_recipes"],
+    )
+    rebuilt_parts = []
+    cursor = 0
+    while cursor < prefix_rows:
+        stop = int(np.searchsorted(times[:prefix_rows], times[cursor], side="right"))
+        rebuilt_parts.append(
+            builder.transform(
+                base[cursor:stop, -1].astype(np.int64),
+                base[cursor:stop, :raw_count][:, temporal_indices],
+            )
+        )
+        cursor = stop
+    base[:, raw_count:raw_count + temporal_count] = np.vstack(rebuilt_parts)
+    return base
+
+
+def session_patch(prefix: np.ndarray | None, offset: int = 0):
+    if prefix is None or not len(prefix):
+        return []
+    return [(int(offset), int(offset) + len(prefix), prefix)]
+
+
 class ShardSequence(lgb.Sequence):
     """LightGBM Sequence-compatible view over disk-backed NumPy shards."""
 
     batch_size = 8192
 
     def __init__(self, cache_dir: Path, segments, extra=None,
-                 base_indices: np.ndarray | None = None):
+                 base_indices: np.ndarray | None = None, patches=None):
         self.cache_dir = cache_dir
         self.segments = list(segments)
         self.extra = extra
         self.base_indices = base_indices
+        self.patches = list(patches or [])
         self.lengths = [end - start for _, start, end in self.segments]
         self.offsets = np.cumsum([0, *self.lengths]).tolist()
 
@@ -416,6 +604,7 @@ class ShardSequence(lgb.Sequence):
         return self.offsets[-1]
 
     def _rows(self, start: int, stop: int):
+        requested_start, requested_stop = start, stop
         parts = []
         while start < stop:
             segment_index = bisect_right(self.offsets, start) - 1
@@ -431,20 +620,26 @@ class ShardSequence(lgb.Sequence):
                 ],
                 dtype=np.float64,
             )
-            if self.base_indices is not None:
-                base = base[:, self.base_indices]
-            if self.extra is not None:
-                base = np.hstack(
-                    [
-                        base,
-                        np.asarray(
-                            self.extra[start:start + count], dtype=np.float64
-                        ),
-                    ]
-                )
             parts.append(base)
             start += count
-        return parts[0] if len(parts) == 1 else np.vstack(parts)
+        output = parts[0] if len(parts) == 1 else np.vstack(parts)
+        for patch_start, patch_end, patch in self.patches:
+            left = max(requested_start, patch_start)
+            right = min(requested_stop, patch_end)
+            if left < right:
+                output[left - requested_start:right - requested_start] = patch[
+                    left - patch_start:right - patch_start
+                ]
+        if self.base_indices is not None:
+            output = output[:, self.base_indices]
+        if self.extra is not None:
+            output = np.hstack([
+                output,
+                np.asarray(
+                    self.extra[requested_start:requested_stop], dtype=np.float64
+                ),
+            ])
+        return output
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -508,34 +703,40 @@ class ConcatenatedSequence(lgb.Sequence):
 
 
 def matrix_for_segments(cache_dir: Path, segments, extra=None,
-                        base_indices: np.ndarray | None = None) -> np.ndarray:
+                        base_indices: np.ndarray | None = None,
+                        patches=None) -> np.ndarray:
     """Materialize one split as a contiguous float32 matrix."""
     parts = []
-    cursor = 0
     for shard_id, start, end in segments:
-        base = np.asarray(load_array(cache_dir, shard_id, "x")[start:end], dtype=np.float32)
-        if base_indices is not None:
-            base = base[:, base_indices]
-        if extra is not None:
-            count = end - start
-            base = np.hstack((base, np.asarray(extra[cursor:cursor + count], dtype=np.float32)))
-            cursor += count
+        base = np.array(
+            load_array(cache_dir, shard_id, "x")[start:end],
+            dtype=np.float32, copy=True,
+        )
         parts.append(base)
     if not parts:
         raise ValueError("cannot materialize an empty set of cache segments")
-    return np.ascontiguousarray(parts[0] if len(parts) == 1 else np.vstack(parts))
+    output = parts[0] if len(parts) == 1 else np.vstack(parts)
+    for patch_start, patch_end, patch in patches or []:
+        output[patch_start:patch_end] = patch
+    if base_indices is not None:
+        output = output[:, base_indices]
+    if extra is not None:
+        output = np.hstack((output, np.asarray(extra, dtype=np.float32)))
+    return np.ascontiguousarray(output)
 
 
 def training_matrix(args, cache_dir: Path, segments, extra=None,
-                    base_indices: np.ndarray | None = None):
+                    base_indices: np.ndarray | None = None, patches=None):
     if args.training_data_mode == "in-memory":
-        matrix = matrix_for_segments(cache_dir, segments, extra, base_indices)
+        matrix = matrix_for_segments(
+            cache_dir, segments, extra, base_indices, patches
+        )
         progress(
             f"materialized matrix: rows={matrix.shape[0]:,}, features={matrix.shape[1]:,}, "
             f"memory={matrix.nbytes / 1024 ** 3:.2f} GiB"
         )
         return matrix
-    return ShardSequence(cache_dir, segments, extra, base_indices)
+    return ShardSequence(cache_dir, segments, extra, base_indices, patches)
 
 
 def concatenate_training_matrices(args, *sources):
@@ -571,16 +772,20 @@ def predict_sequence(model, sequence, label: str = "prediction") -> np.ndarray:
     return output
 
 
-def low_risk_lgb_params(args, seed=None):
+def low_risk_lgb_params(args, seed=None, profile="smoothed"):
     seed = int(args.seed if seed is None else seed)
+    if profile not in TARGET_PARAM_PROFILES:
+        raise ValueError(f"unknown LightGBM profile: {profile}")
+    profile_params = {
+        key: value for key, value in TARGET_PARAM_PROFILES[profile].items()
+        if key != "regularization_rank"
+    }
     return {
         "objective": "regression", "metric": "l2", "learning_rate": 0.03,
         "boosting_type": "gbdt", "data_sample_strategy": "bagging",
-        "num_leaves": 63, "max_depth": 12, "min_data_in_leaf": 3500,
-        "feature_fraction": 0.9, "feature_fraction_bynode": 0.9,
-        "bagging_fraction": 0.85, "bagging_freq": 1,
-        "lambda_l1": 1.0, "lambda_l2": 15.0, "path_smooth": 100.0,
+        **profile_params, "bagging_freq": 1,
         "max_bin": 255, "deterministic": True, "force_col_wise": True,
+        "histogram_pool_size": 8192.0,
         "num_threads": args.threads, "seed": seed,
         "bagging_seed": seed, "feature_fraction_seed": seed,
         "extra_seed": seed, "data_random_seed": int(args.seed),
@@ -589,8 +794,9 @@ def low_risk_lgb_params(args, seed=None):
 
 
 def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight,
-              rounds, args, progress_label="LightGBM", categorical_feature=None):
-    params = low_risk_lgb_params(args)
+              rounds, args, progress_label="LightGBM", categorical_feature=None,
+              profile="smoothed"):
+    params = low_risk_lgb_params(args, profile=profile)
     categorical_feature = categorical_feature or "auto"
     train_set = lgb.Dataset(
         sequence, label=label, weight=weight,
@@ -611,8 +817,8 @@ def train_lgb(sequence, label, weight, valid_sequence, valid_label, valid_weight
 
 def train_lgb_fixed(sequence, label, weight, rounds, args,
                     progress_label="LightGBM", categorical_feature=None,
-                    seed=None):
-    params = low_risk_lgb_params(args, seed=seed)
+                    seed=None, profile="smoothed"):
+    params = low_risk_lgb_params(args, seed=seed, profile=profile)
     train_set = lgb.Dataset(
         sequence, label=label, weight=weight,
         categorical_feature=categorical_feature or "auto",
@@ -631,6 +837,42 @@ def weighted_r2(y, pred, weight):
     y, pred, weight = y[valid], pred[valid], weight[valid]
     denominator = np.sum(weight * y * y)
     return float(1.0 - np.sum(weight * (y - pred) ** 2) / denominator) if denominator > 0 else 0.0
+
+
+def fitted_prediction_scale(y, pred, weight):
+    y, pred, weight = map(
+        lambda value: np.asarray(value, dtype=np.float64),
+        (y, pred, weight),
+    )
+    valid = (
+        np.isfinite(y) & np.isfinite(pred) & np.isfinite(weight)
+        & (weight > 0)
+    )
+    denominator = float(np.sum(weight[valid] * pred[valid] ** 2))
+    if denominator <= 0.0 or not np.isfinite(denominator):
+        return 1.0
+    scale = float(np.sum(weight[valid] * y[valid] * pred[valid]) / denominator)
+    return scale if np.isfinite(scale) else 1.0
+
+
+def clipping_diagnostics(y, pred, weight, bounds=None):
+    pred = np.asarray(pred, dtype=np.float64)
+    finite = pred[np.isfinite(pred)]
+    if bounds is None:
+        bounds = (
+            tuple(np.quantile(finite, [0.001, 0.999]))
+            if len(finite) else (0.0, 0.0)
+        )
+    lower, upper = map(float, bounds)
+    raw_score = weighted_r2(y, pred, weight)
+    clipped_score = weighted_r2(y, np.clip(pred, lower, upper), weight)
+    return {
+        "raw_score": raw_score,
+        "clipped_score": clipped_score,
+        "clipping_delta": float(clipped_score - raw_score),
+        "clip_min": lower,
+        "clip_max": upper,
+    }
 
 
 def segmented_validation_scores(time_ids, y, pred, weight, parts: int = 4):
@@ -835,6 +1077,22 @@ def configured_target_seeds(args) -> list[int]:
     return values
 
 
+def configured_target_profiles(args) -> list[str]:
+    values = [
+        value.strip() for value in args.target_param_candidates.split(",")
+        if value.strip()
+    ]
+    if not values:
+        raise ValueError("--target-param-candidates must not be empty")
+    unknown = [value for value in values if value not in TARGET_PARAM_PROFILES]
+    if unknown:
+        raise ValueError(
+            f"unknown target parameter profiles: {unknown}; "
+            f"available={list(TARGET_PARAM_PROFILES)}"
+        )
+    return list(dict.fromkeys(values))
+
+
 def selected_experiments(args, responders: list[str]) -> list[str]:
     if args.ablation_mode != "all":
         return [args.ablation_mode]
@@ -961,7 +1219,8 @@ def shuffled_within_time(values, time_ids, seed):
 
 def target_experiment_matrices(args, cache_dir, train_segments, valid_segments,
                                oof_hat, valid_hat, spec,
-                               train_times=None, valid_times=None):
+                               train_times=None, valid_times=None,
+                               train_patches=None, valid_patches=None):
     responder_indices = spec["responder_indices"]
     train_extra = (
         np.asarray(oof_hat[:, responder_indices], dtype=np.float32)
@@ -986,20 +1245,31 @@ def target_experiment_matrices(args, cache_dir, train_segments, valid_segments,
     base_indices = np.asarray(spec["base_indices"], dtype=np.int64)
     return (
         training_matrix(
-            args, cache_dir, train_segments, train_extra, base_indices
+            args, cache_dir, train_segments, train_extra, base_indices,
+            train_patches,
         ),
         training_matrix(
-            args, cache_dir, valid_segments, valid_extra, base_indices
+            args, cache_dir, valid_segments, valid_extra, base_indices,
+            valid_patches,
         ),
     )
 
 
 def main():
     args = parse_args()
+    if args.oof_folds < 3:
+        raise ValueError("--oof-folds must be at least 3 for target walk-forward")
+    if args.feature_health_rows < 0:
+        raise ValueError("--feature-health-rows must be non-negative")
     responders = configured_responders(args)
     target_seeds = configured_target_seeds(args)
+    target_profiles = configured_target_profiles(args)
     requested_target_experiments = selected_experiments(args, responders)
     data_root, work_dir, model_dir = Path(args.data_root), Path(args.work_dir), Path(args.model_dir)
+    data_files = manifest_files(data_root)
+    if not data_files:
+        raise ValueError("no training parquet files")
+    requested_input_files = input_file_fingerprints(data_files)
     cache_dir = work_dir / "cache"
     model_dir.mkdir(parents=True, exist_ok=True)
     final_files = [model_dir / f"{name}.txt" for name in responders]
@@ -1008,6 +1278,7 @@ def main():
         *(model_dir / f"target_final_seed{seed}.txt" for seed in target_seeds),
         model_dir / "metadata.json",
         model_dir / "validation_predictions.npz",
+        model_dir / "feature_health_report.json",
     ])
     existing_model_metadata = None
     if (model_dir / "metadata.json").exists():
@@ -1033,6 +1304,8 @@ def main():
         "target_rounds": args.target_rounds,
         "early_stopping": args.early_stopping,
         "seed": args.seed,
+        "target_param_candidates": target_profiles,
+        "feature_health_rows": args.feature_health_rows,
     }
     model_metadata_matches = bool(
         existing_model_metadata
@@ -1048,6 +1321,7 @@ def main():
         == args.purge_steps
         and existing_model_metadata.get("training_config")
         == requested_training_config
+        and existing_model_metadata.get("input_files") == requested_input_files
     )
     target_suite_matches = bool(
         existing_model_metadata
@@ -1081,6 +1355,9 @@ def main():
                 "being rebuilt"
             )
             shutil.rmtree(work_dir / "selection_responder_models")
+        if (work_dir / "target_cv_models").exists():
+            progress("removing target CV models because the cache is being rebuilt")
+            shutil.rmtree(work_dir / "target_cv_models")
     importance_path = Path(args.feature_importance) if args.feature_importance else (
         Path(__file__).resolve().parent.parent / "lgb_catboost_strategy" / "model" / "feature_importance.csv"
     )
@@ -1092,21 +1369,27 @@ def main():
     if cache_metadata_path.exists():
         existing_metadata = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
         cache_matches = (
-            int(existing_metadata.get("cache_schema_version", 0)) == 6
+            int(existing_metadata.get("cache_schema_version", 0))
+            == CACHE_SCHEMA_VERSION
             and int(existing_metadata.get("temporal_engine_version", 0))
             == TEMPORAL_ENGINE_VERSION
             and bool(existing_metadata.get("temporal_recipes"))
             and existing_metadata.get("temporal_plan_hash", "")
             == temporal_config_hash(plan_path, importance_path, args.temporal_feature_count)
             and existing_metadata.get("responders") == responders
+            and existing_metadata.get("input_files") == requested_input_files
+            and int(existing_metadata.get("feature_health_rows", -1))
+            == min(args.feature_health_rows, sum(item["rows"] for item in existing_metadata.get("shards", [])))
         )
         if not cache_matches:
-            progress("existing cache has a different temporal feature schema; rebuilding it")
+            progress("existing cache is stale or has an incompatible schema; rebuilding it")
             shutil.rmtree(cache_dir)
             if (work_dir / "oof_models").exists():
                 shutil.rmtree(work_dir / "oof_models")
             if (work_dir / "selection_responder_models").exists():
                 shutil.rmtree(work_dir / "selection_responder_models")
+            if (work_dir / "target_cv_models").exists():
+                shutil.rmtree(work_dir / "target_cv_models")
     if cache_metadata_path.exists():
         progress(f"loading existing cache metadata: {cache_dir / 'cache.json'}")
         metadata = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
@@ -1115,7 +1398,7 @@ def main():
         metadata = build_cache(
             data_root, cache_dir, args.shard_rows, args.batch_size,
             args.temporal_feature_count, importance_path, plan_path,
-            responders,
+            responders, args.feature_health_rows,
         )
 
     progress(f"scanning time_id from {len(metadata['shards'])} cache shards")
@@ -1142,6 +1425,7 @@ def main():
         shape=(oof_rows, len(responders)),
     )
     oof_cursor = 0
+    oof_fold_records = []
     responder_best_iterations: dict[str, list[int]] = {
         name: [] for name in responders
     }
@@ -1152,6 +1436,7 @@ def main():
     oof_model_dir = work_dir / "oof_models"
     oof_signature_payload = {
         "feature_columns": metadata["feature_columns"],
+        "input_files": metadata.get("input_files", []),
         "temporal_features": metadata["temporal_features"],
         "temporal_recipes": metadata["temporal_recipes"],
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
@@ -1165,6 +1450,7 @@ def main():
         "seed": args.seed,
         "responder_rounds": args.responder_rounds,
         "early_stopping": args.early_stopping,
+        "validation_history": "cold_start_per_fold",
     }
     oof_signature = hashlib.sha256(
         json.dumps(oof_signature_payload, sort_keys=True).encode("utf-8")
@@ -1191,8 +1477,14 @@ def main():
         fit_end = int(train_times[fit_stop_index])
         fit_segments = segments_for_range(cache_dir, metadata, None, fit_end)
         pred_segments = segments_for_range(cache_dir, metadata, fold_start, fold_end)
+        cold_prefix = build_cold_start_prefix(
+            cache_dir, metadata, pred_segments
+        )
         fit_x = training_matrix(args, cache_dir, fit_segments)
-        pred_x = training_matrix(args, cache_dir, pred_segments)
+        pred_x = training_matrix(
+            args, cache_dir, pred_segments,
+            patches=session_patch(cold_prefix),
+        )
         fit_w = vector_for_segments(cache_dir, fit_segments, "weight")
         pred_w = vector_for_segments(cache_dir, pred_segments, "weight")
         responders_fit = vector_for_segments(cache_dir, fit_segments, "responder")
@@ -1202,6 +1494,7 @@ def main():
             f"predict_rows={len(pred_x):,}, purge_steps={args.purge_steps}, "
             f"time_id={fold_start}..{fold_end - 1}"
         )
+        fold_oof_start = oof_cursor
         for column, name in enumerate(responders):
             fold_model_path = oof_model_dir / f"fold_{fold:02d}_{name}.txt"
             if args.skip_existing_models and fold_model_path.exists():
@@ -1265,6 +1558,17 @@ def main():
                 f"fold={fold + 1}, responder={name}",
             )
         oof_cursor += len(pred_x)
+        oof_fold_records.append(
+            {
+                "fold": fold,
+                "time_start": fold_start,
+                "time_end": fold_end,
+                "segments": pred_segments,
+                "oof_start": fold_oof_start,
+                "oof_end": oof_cursor,
+                "cold_prefix": cold_prefix,
+            }
+        )
         oof_hat.flush()
         if args.training_data_mode == "in-memory":
             del fit_x, pred_x
@@ -1272,6 +1576,9 @@ def main():
         progress(f"OOF fold {fold + 1}/{args.oof_folds} complete")
 
     valid_segments = segments_for_range(cache_dir, metadata, valid_cutoff, None)
+    holdout_cold_prefix = build_cold_start_prefix(
+        cache_dir, metadata, valid_segments
+    )
     target_train_upper = (
         int(train_times[-args.purge_steps])
         if args.purge_steps > 0 else valid_cutoff
@@ -1280,7 +1587,10 @@ def main():
         cache_dir, metadata, None, target_train_upper
     )
     train_x = training_matrix(args, cache_dir, train_segments)
-    valid_x = training_matrix(args, cache_dir, valid_segments)
+    valid_x = training_matrix(
+        args, cache_dir, valid_segments,
+        patches=session_patch(holdout_cold_prefix),
+    )
     train_w = vector_for_segments(cache_dir, train_segments, "weight")
     valid_w = vector_for_segments(cache_dir, valid_segments, "weight")
     train_responders = vector_for_segments(cache_dir, train_segments, "responder")
@@ -1355,130 +1665,423 @@ def main():
     )
     y_valid = vector_for_segments(cache_dir, valid_segments, "target")
     valid_times = vector_for_segments(cache_dir, valid_segments, "time")
-    progress(f"target experiments: {variants}")
-    ablation_scores = {}
+    progress(
+        f"target walk-forward experiments: variants={variants}, "
+        f"profiles={target_profiles}"
+    )
     importance_frames = []
-    best_variant = None
-    best_score = -np.inf
-    best_target_model = None
-    best_valid_prediction = None
-    for variant in variants:
+    target_cv_signature_payload = {
+        "oof_signature": oof_signature,
+        "variants": variants,
+        "profiles": target_profiles,
+        "target_rounds": args.target_rounds,
+        "early_stopping": args.early_stopping,
+        "history": "cold_start_per_fold",
+    }
+    target_cv_signature = hashlib.sha256(
+        json.dumps(target_cv_signature_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    target_cv_dir = work_dir / "target_cv_models" / target_cv_signature[:16]
+    target_cv_dir.mkdir(parents=True, exist_ok=True)
+    (target_cv_dir / "config.json").write_text(
+        json.dumps(target_cv_signature_payload, indent=2), encoding="utf-8"
+    )
+
+    def oof_patches_for_rows(row_count):
+        patches = []
+        for record in oof_fold_records:
+            prefix = record["cold_prefix"]
+            if prefix is None or record["oof_start"] >= row_count:
+                continue
+            available = min(len(prefix), row_count - record["oof_start"])
+            patches.append((
+                record["oof_start"], record["oof_start"] + available,
+                prefix[:available],
+            ))
+        return patches
+
+    target_cv_records = oof_fold_records[1:]
+    if len(target_cv_records) < 2:
+        raise ValueError("target walk-forward requires at least three responder OOF folds")
+
+    target_cv_results = {}
+
+    def evaluate_target_cv(variant, profile):
+        cache_key = (variant, profile)
+        if cache_key in target_cv_results:
+            return target_cv_results[cache_key]
+        spec = experiment_specs[variant]
+        fold_reports = []
+        all_y, all_w, all_pred = [], [], []
+        for record in target_cv_records:
+            fold = int(record["fold"])
+            fit_stop_index = max(
+                warmup_index + 1,
+                int(oof_boundaries[fold]) - args.purge_steps,
+            )
+            fit_end = int(train_times[fit_stop_index])
+            fold_train_segments = segments_for_range(
+                cache_dir, metadata, int(train_times[warmup_index]), fit_end
+            )
+            fold_train_rows = sum(
+                end - start for _, start, end in fold_train_segments
+            )
+            fold_valid_segments = record["segments"]
+            fold_train_hat = oof_hat[:fold_train_rows]
+            fold_valid_hat = oof_hat[record["oof_start"]:record["oof_end"]]
+            needs_time = spec["shuffle_within_time"]
+            fold_train_times = (
+                vector_for_segments(cache_dir, fold_train_segments, "time")
+                if needs_time else None
+            )
+            fold_valid_times = (
+                vector_for_segments(cache_dir, fold_valid_segments, "time")
+                if needs_time else None
+            )
+            fold_train_x, fold_valid_x = target_experiment_matrices(
+                args, cache_dir, fold_train_segments, fold_valid_segments,
+                fold_train_hat, fold_valid_hat, spec,
+                fold_train_times, fold_valid_times,
+                train_patches=oof_patches_for_rows(fold_train_rows),
+                valid_patches=session_patch(record["cold_prefix"]),
+            )
+            fold_y_train = vector_for_segments(
+                cache_dir, fold_train_segments, "target"
+            )
+            fold_w_train = vector_for_segments(
+                cache_dir, fold_train_segments, "weight"
+            )
+            fold_y_valid = vector_for_segments(
+                cache_dir, fold_valid_segments, "target"
+            )
+            fold_w_valid = vector_for_segments(
+                cache_dir, fold_valid_segments, "weight"
+            )
+            model_path = target_cv_dir / f"{profile}_{variant}_fold{fold:02d}.txt"
+            if args.skip_existing_models and model_path.exists():
+                model = lgb.Booster(model_file=str(model_path))
+                if model.num_feature() != len(spec["feature_names"]):
+                    model_path.unlink()
+                    model = None
+            else:
+                model = None
+            if model is None:
+                progress(
+                    f"target CV: profile={profile}, variant={variant}, "
+                    f"fold={fold}, train_rows={len(fold_train_x):,}, "
+                    f"valid_rows={len(fold_valid_x):,}"
+                )
+                model = train_lgb(
+                    fold_train_x, fold_y_train, fold_w_train,
+                    fold_valid_x, fold_y_valid, fold_w_valid,
+                    args.target_rounds, args,
+                    f"target CV {profile}/{variant}/fold{fold}",
+                    categorical_feature=[
+                        spec["feature_names"].index("asset_id")
+                    ],
+                    profile=profile,
+                )
+                model.save_model(str(model_path))
+            prediction = predict_sequence(
+                model, fold_valid_x,
+                f"target CV {profile}/{variant}/fold{fold}",
+            )
+            score = weighted_r2(fold_y_valid, prediction, fold_w_valid)
+            best_iteration = int(model.best_iteration)
+            if best_iteration <= 0:
+                best_iteration = int(model.current_iteration())
+            if best_iteration <= 0:
+                best_iteration = int(args.target_rounds)
+            fold_reports.append({
+                "fold": fold,
+                "time_start": record["time_start"],
+                "time_end": record["time_end"],
+                "train_rows": len(fold_train_x),
+                "valid_rows": len(fold_valid_x),
+                "score": score,
+                "best_iteration": best_iteration,
+            })
+            all_y.append(fold_y_valid)
+            all_w.append(fold_w_valid)
+            all_pred.append(prediction)
+            progress(
+                f"target CV result: profile={profile}, variant={variant}, "
+                f"fold={fold}, R2={score:.8f}"
+            )
+            if args.training_data_mode == "in-memory":
+                del fold_train_x, fold_valid_x
+                gc.collect()
+        scores = np.asarray([item["score"] for item in fold_reports])
+        merged_y = np.concatenate(all_y)
+        merged_w = np.concatenate(all_w)
+        merged_pred = np.concatenate(all_pred)
+        clip = clipping_diagnostics(merged_y, merged_pred, merged_w)
+        result = {
+            "profile": profile,
+            "folds": fold_reports,
+            "mean_fold_score": float(np.mean(scores)),
+            "std_fold_score": float(np.std(scores)),
+            "min_fold_score": float(np.min(scores)),
+            "latest_fold_score": float(scores[-1]),
+            "positive_folds": int(np.sum(scores > 0.0)),
+            "mean_iterations": max(1, int(round(np.mean([
+                item["best_iteration"] for item in fold_reports
+            ])))),
+            "oof_raw": clip["raw_score"],
+            "oof_clipped": clip["clipped_score"],
+            "oof_clipping_delta": clip["clipping_delta"],
+            "clip_min": clip["clip_min"],
+            "clip_max": clip["clip_max"],
+            "fitted_oof_scale": fitted_prediction_scale(
+                merged_y, merged_pred, merged_w
+            ),
+        }
+        target_cv_results[cache_key] = result
+        return result
+
+    tuning_variant = (
+        "LGB468" if "LGB468" in variants
+        else "A" if "A" in variants
+        else next(name for name in variants if experiment_specs[name]["deployable"])
+    )
+    parameter_search = []
+    for index, profile in enumerate(target_profiles, start=1):
+        result = evaluate_target_cv(tuning_variant, profile)
+        parameter_search.append(result)
+        progress_bar(
+            "target parameter search", index, len(target_profiles),
+            f"{profile}, mean={result['mean_fold_score']:.8f}",
+        )
+    parameter_search.sort(
+        key=lambda item: (
+            -item["mean_fold_score"],
+            -TARGET_PARAM_PROFILES[item["profile"]]["regularization_rank"],
+            item["mean_iterations"],
+        )
+    )
+    selected_target_profile = parameter_search[0]["profile"]
+    progress(
+        f"selected target parameter profile={selected_target_profile}; "
+        f"tuning_variant={tuning_variant}"
+    )
+
+    comparators = {
+        "C4": ["A"],
+        "LGB468": ["A"],
+        "LGB468_C4": ["LGB468", "C4"],
+    }
+    cv_results = {
+        variant: evaluate_target_cv(variant, selected_target_profile)
+        for variant in variants
+    }
+    cv_ranked = sorted(
+        (name for name in variants if experiment_specs[name]["deployable"]),
+        key=lambda name: -cv_results[name]["mean_fold_score"],
+    )
+    cv_winner = cv_ranked[0]
+    diagnostic_holdout = bool(
+        args.target_experiments
+        or args.experiment_suite in {
+            "legacy", "responder", "c4-mechanism", "single-responder", "all"
+        }
+    )
+    holdout_variants = list(variants) if diagnostic_holdout else []
+
+    def add_with_parents(name):
+        if name in holdout_variants:
+            return
+        holdout_variants.append(name)
+        for parent in comparators.get(name, []):
+            if parent in variants:
+                add_with_parents(parent)
+
+    if not diagnostic_holdout:
+        add_with_parents(cv_winner)
+    progress(
+        f"terminal holdout is frozen after CV selection: cv_winner={cv_winner}, "
+        f"evaluated={holdout_variants}"
+    )
+    ablation_scores = {
+        variant: {
+            **cv_results[variant],
+            "features": len(experiment_specs[variant]["feature_names"]),
+            "best_iteration": cv_results[variant]["mean_iterations"],
+            "temporal_groups": experiment_specs[variant]["temporal_groups"],
+            "responders": experiment_specs[variant]["responders"],
+            "holdout_evaluated": False,
+        }
+        for variant in variants
+    }
+    for index, variant in enumerate(holdout_variants, start=1):
+        cv_result = cv_results[variant]
         spec = experiment_specs[variant]
         target_train_x, target_valid_x = target_experiment_matrices(
             args, cache_dir, target_train_segments, valid_segments,
-            target_oof_hat, valid_hat,
-            spec, target_train_times, valid_times,
+            target_oof_hat, valid_hat, spec, target_train_times, valid_times,
+            train_patches=oof_patches_for_rows(target_train_rows),
+            valid_patches=session_patch(holdout_cold_prefix),
         )
         variant_path = model_dir / f"target_{variant}.txt"
-        old_spec = (
-            existing_model_metadata.get("target_experiment_specs", {}).get(variant)
-            if existing_model_metadata else None
+        progress(
+            f"terminal holdout fit: variant={variant}, "
+            f"rounds={cv_result['mean_iterations']}"
         )
-        can_load = bool(
-            args.skip_existing_models
-            and model_metadata_matches
-            and variant_path.exists()
-            and old_spec
-            and old_spec.get("base_indices") == spec["base_indices"]
-            and old_spec.get("responders") == spec["responders"]
-            and old_spec.get("shuffle_within_time", False)
-            == spec["shuffle_within_time"]
+        target_model = train_lgb_fixed(
+            target_train_x, y_train, w_train,
+            cv_result["mean_iterations"], args,
+            f"target holdout {variant}",
+            categorical_feature=[spec["feature_names"].index("asset_id")],
+            profile=selected_target_profile,
         )
-        if can_load:
-            candidate = lgb.Booster(model_file=str(variant_path))
-            can_load = candidate.num_feature() == len(spec["feature_names"])
-        if can_load:
-            progress(f"loading existing target experiment: {variant_path.name}")
-            target_model = candidate
-        else:
-            progress(
-                f"training target experiment {variant}: "
-                f"features={len(spec['feature_names'])}, "
-                f"temporal_groups={spec['temporal_groups']}, "
-                f"responders={spec['responders']}, "
-                f"train_rows={len(target_train_x):,}, valid_rows={len(target_valid_x):,}"
-            )
-            target_model = train_lgb(
-                target_train_x, y_train, w_train, target_valid_x,
-                y_valid, valid_w, args.target_rounds, args,
-                f"target {variant}",
-                categorical_feature=[spec["feature_names"].index("asset_id")],
-            )
-            target_model.save_model(str(variant_path))
-        prediction = predict_sequence(target_model, target_valid_x, f"target {variant} validation")
-        score = weighted_r2(y_valid, prediction, valid_w)
+        target_model.save_model(str(variant_path))
+        prediction = predict_sequence(
+            target_model, target_valid_x, f"target holdout {variant}"
+        )
+        holdout_clip = clipping_diagnostics(
+            y_valid, prediction, valid_w,
+            (cv_result["clip_min"], cv_result["clip_max"]),
+        )
+        clipping_enabled = bool(
+            cv_result["oof_clipping_delta"] > 0.0
+            and holdout_clip["clipping_delta"] >= 0.0
+        )
+        deployed_prediction = (
+            np.clip(prediction, cv_result["clip_min"], cv_result["clip_max"])
+            if clipping_enabled else prediction
+        )
         segmented = segmented_validation_scores(
-            valid_times, y_valid, prediction, valid_w
+            valid_times, y_valid, deployed_prediction, valid_w
         )
-        best_iteration = int(target_model.best_iteration)
-        if best_iteration <= 0:
-            best_iteration = int(target_model.current_iteration())
-        ablation_scores[variant] = {
-            "score": score,
+        ablation_scores[variant].update({
+            "score": weighted_r2(y_valid, deployed_prediction, valid_w),
+            "holdout_raw": holdout_clip["raw_score"],
+            "holdout_clipped": holdout_clip["clipped_score"],
+            "holdout_clipping_delta": holdout_clip["clipping_delta"],
+            "clipping_enabled": clipping_enabled,
             "features": target_model.num_feature(),
-            "best_iteration": best_iteration,
+            "best_iteration": cv_result["mean_iterations"],
             "file": variant_path.name,
             "temporal_groups": spec["temporal_groups"],
             "responders": spec["responders"],
             "segmented_validation": segmented,
-        }
-        importance_frames.append(
-            pd.DataFrame(
-                {
-                    "variant": variant,
-                    "feature": spec["feature_names"],
-                    "importance_gain": target_model.feature_importance(importance_type="gain"),
-                    "importance_split": target_model.feature_importance(importance_type="split"),
-                }
-            )
-        )
-        if spec["deployable"] and score > best_score:
-            best_variant = variant
-            best_score = score
-            best_target_model = target_model
-            best_valid_prediction = prediction.copy()
-        part_scores = ", ".join(
-            f"P{item['part']}={item['score']:.8f}"
-            for item in segmented["parts"]
-        )
-        progress(
-            f"target experiment {variant}: zero-mean R2={score:.8f}, "
-            f"segment_std={segmented['std']:.8f}; {part_scores}"
-        )
+            "holdout_prediction": prediction,
+            "holdout_evaluated": True,
+        })
+        importance_frames.append(pd.DataFrame({
+            "variant": variant,
+            "feature": spec["feature_names"],
+            "importance_gain": target_model.feature_importance(importance_type="gain"),
+            "importance_split": target_model.feature_importance(importance_type="split"),
+        }))
         progress_bar(
-            "target experiments",
-            variants.index(variant) + 1,
-            len(variants),
-            f"{variant}, R2={score:.8f}",
+            "target holdout", index, len(holdout_variants),
+            f"{variant}, raw={holdout_clip['raw_score']:.8f}",
         )
         if args.training_data_mode == "in-memory":
             del target_train_x, target_valid_x
             gc.collect()
 
-    if "A" in ablation_scores:
-        baseline_score = float(ablation_scores["A"]["score"])
-        baseline_parts = ablation_scores["A"]["segmented_validation"]["parts"]
-        for result in ablation_scores.values():
-            result["delta_vs_A"] = float(result["score"] - baseline_score)
-            result_parts = result["segmented_validation"]["parts"]
+    for variant in holdout_variants:
+        result = ablation_scores[variant]
+        checks = {
+            "oof_raw_positive": bool(result["oof_raw"] > 0.0),
+            "holdout_raw_positive": bool(result["holdout_raw"] > 0.0),
+            "scale_in_range": bool(0.75 <= result["fitted_oof_scale"] <= 1.25),
+        }
+        comparison_report = {}
+        for parent in comparators.get(variant, []):
+            if parent not in holdout_variants:
+                continue
+            parent_result = ablation_scores[parent]
+            deltas = [
+                current["score"] - baseline["score"]
+                for current, baseline in zip(
+                    result["folds"], parent_result["folds"]
+                )
+            ]
+            required_positive = max(1, int(np.ceil(0.8 * len(deltas))))
+            comparison_report[parent] = {
+                "mean_fold_delta": float(np.mean(deltas)),
+                "fold_deltas": list(map(float, deltas)),
+                "positive_folds": int(np.sum(np.asarray(deltas) > 0.0)),
+                "required_positive_folds": required_positive,
+                "latest_fold_delta": float(deltas[-1]),
+                "holdout_raw_delta": float(
+                    result["holdout_raw"] - parent_result["holdout_raw"]
+                ),
+            }
+            checks[f"mean_delta_vs_{parent}_positive"] = bool(np.mean(deltas) > 0.0)
+            checks[f"stable_delta_vs_{parent}"] = bool(
+                np.sum(np.asarray(deltas) > 0.0) >= required_positive
+            )
+            checks[f"latest_delta_vs_{parent}_positive"] = bool(deltas[-1] > 0.0)
+            checks[f"holdout_delta_vs_{parent}_positive"] = bool(
+                result["holdout_raw"] > parent_result["holdout_raw"]
+            )
+        result["comparisons"] = comparison_report
+        result["promotion_gates"] = {
+            **checks,
+            "passed": bool(all(checks.values())),
+        }
+
+    if "A" in holdout_variants:
+        baseline = ablation_scores["A"]
+        for variant in holdout_variants:
+            result = ablation_scores[variant]
+            result["delta_vs_A"] = float(result["score"] - baseline["score"])
             result["segment_delta_vs_A"] = [
-                float(current["score"] - baseline["score"])
-                for current, baseline in zip(result_parts, baseline_parts)
+                float(current["score"] - reference["score"])
+                for current, reference in zip(
+                    result["segmented_validation"]["parts"],
+                    baseline["segmented_validation"]["parts"],
+                )
+            ]
+            result["cv_fold_delta_vs_A"] = [
+                float(current["score"] - reference["score"])
+                for current, reference in zip(
+                    result["folds"], baseline["folds"]
+                )
             ]
 
-    if best_variant is None or best_target_model is None:
-        raise RuntimeError("no target experiment was trained")
-    valid_pred = best_valid_prediction
+    deployable_ranked = sorted(
+        (name for name in holdout_variants if experiment_specs[name]["deployable"]),
+        key=lambda name: -ablation_scores[name]["mean_fold_score"],
+    )
+    passing = [
+        name for name in deployable_ranked
+        if ablation_scores[name]["promotion_gates"]["passed"]
+    ]
+    best_variant = passing[0] if passing else deployable_ranked[0]
+    if not passing:
+        progress(
+            "warning: no target variant passed every promotion gate; "
+            f"falling back to CV winner {best_variant}"
+        )
     best_spec = experiment_specs[best_variant]
-    best_rounds = int(ablation_scores[best_variant]["best_iteration"])
+    best_result = ablation_scores[best_variant]
+    best_rounds = int(best_result["mean_iterations"])
+    valid_pred_raw = np.asarray(best_result.pop("holdout_prediction"))
+    for name, result in ablation_scores.items():
+        if name != best_variant:
+            result.pop("holdout_prediction", None)
+    clipping_enabled = bool(best_result["clipping_enabled"])
+    valid_pred = (
+        np.clip(valid_pred_raw, best_result["clip_min"], best_result["clip_max"])
+        if clipping_enabled else valid_pred_raw
+    )
+    clip_min = float(best_result["clip_min"])
+    clip_max = float(best_result["clip_max"])
 
     progress(
         f"refitting selected target {best_variant} with validation labels: "
-        f"rounds={best_rounds}, seeds={target_seeds}"
+        f"profile={selected_target_profile}, rounds={best_rounds}, "
+        f"seeds={target_seeds}"
     )
     refit_oof_x, refit_valid_x = target_experiment_matrices(
         args, cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
         best_spec,
+        train_patches=oof_patches_for_rows(oof_rows),
+        valid_patches=session_patch(holdout_cold_prefix),
     )
     target_refit_x = concatenate_training_matrices(
         args, refit_oof_x, refit_valid_x
@@ -1521,6 +2124,7 @@ def main():
                     best_spec["feature_names"].index("asset_id")
                 ],
                 seed=seed,
+                profile=selected_target_profile,
             )
             target_model.save_model(str(target_seed_path))
         target_model_files.append(filename)
@@ -1589,14 +2193,17 @@ def main():
     (model_dir / "ablation_report.json").write_text(
         json.dumps(
             {"best_variant": best_variant, "scores": ablation_scores,
+             "cv_winner": cv_winner,
+             "terminal_holdout_variants": holdout_variants,
              "target_experiment_specs": experiment_specs,
+             "target_parameter_search": parameter_search,
+             "selected_target_profile": selected_target_profile,
              "responder_diagnostics": responder_diagnostics,
              "c4_mechanism": mechanism_summary},
             indent=2,
         ),
         encoding="utf-8",
     )
-    clip_min, clip_max = np.quantile(valid_pred[np.isfinite(valid_pred)], [0.001, 0.999])
     valid_assets = vector_for_segments(
         cache_dir, valid_segments, "x", column=-1
     ).astype(np.int64)
@@ -1606,9 +2213,7 @@ def main():
         asset_id=valid_assets,
         target=np.asarray(y_valid, dtype=np.float32),
         weight=np.asarray(valid_w, dtype=np.float32),
-        prediction=np.asarray(
-            np.clip(valid_pred, clip_min, clip_max), dtype=np.float32
-        ),
+        prediction=np.asarray(valid_pred, dtype=np.float32),
     )
     output = {
         "strategy": "responder_assisted_lgb_catboost_strategy",
@@ -1618,6 +2223,10 @@ def main():
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
         "temporal_feature_columns": metadata["temporal_feature_columns"],
         "temporal_plan_hash": metadata.get("temporal_plan_hash", ""),
+        "input_files": metadata.get("input_files", []),
+        "cache_schema_version": metadata.get("cache_schema_version"),
+        "feature_health_report": "feature_health_report.json",
+        "unhealthy_features": metadata.get("unhealthy_features", []),
         "responder_models": responder_files,
         "target_model": "target_lightgbm.txt",
         "target_models": target_model_files,
@@ -1629,6 +2238,13 @@ def main():
         "target_feature_columns": best_spec["feature_names"],
         "target_experiment_specs": experiment_specs,
         "trained_target_experiments": variants,
+        "target_validation_protocol": "purged_walk_forward_then_terminal_holdout",
+        "validation_history": "cold_start_per_fold",
+        "cv_winner": cv_winner,
+        "terminal_holdout_variants": holdout_variants,
+        "target_parameter_search": parameter_search,
+        "selected_target_profile": selected_target_profile,
+        "target_param_profiles": TARGET_PARAM_PROFILES,
         "ablation_scores": ablation_scores,
         "responder_diagnostics": responder_diagnostics,
         "target_feature_importance": "target_feature_importance.csv",
@@ -1636,7 +2252,9 @@ def main():
         "valid_cutoff_time_id": valid_cutoff, "oof_folds": args.oof_folds,
         "purge_steps": args.purge_steps,
         "lgb_profile_version": LGB_PROFILE_VERSION,
-        "lgb_params": low_risk_lgb_params(args),
+        "lgb_params": low_risk_lgb_params(
+            args, profile=selected_target_profile
+        ),
         "categorical_features": ["asset_id"],
         "training_config": requested_training_config,
         "warmup_fraction": args.warmup_fraction, "target_train_rows": len(y_train),
@@ -1644,9 +2262,24 @@ def main():
         "responder_best_iterations": {
             name: int(np.median(values)) for name, values in responder_best_iterations.items()
         },
-        "valid_rows": len(y_valid), "valid_score": weighted_r2(y_valid, valid_pred, valid_w),
-        "prediction_scale": 1.0, "clip_min": float(clip_min), "clip_max": float(clip_max),
+        "valid_rows": len(y_valid),
+        "valid_score": weighted_r2(y_valid, valid_pred, valid_w),
+        "valid_raw_score": weighted_r2(y_valid, valid_pred_raw, valid_w),
+        "valid_clipped_score": weighted_r2(
+            y_valid,
+            np.clip(valid_pred_raw, clip_min, clip_max),
+            valid_w,
+        ),
+        "prediction_scale": 1.0,
+        "fitted_oof_scale": best_result["fitted_oof_scale"],
+        "clipping_enabled": clipping_enabled,
+        "clip_min": clip_min, "clip_max": clip_max,
+        "promotion_gates": best_result["promotion_gates"],
     }
+    shutil.copyfile(
+        cache_dir / metadata["feature_health_report"],
+        model_dir / "feature_health_report.json",
+    )
     (model_dir / "metadata.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
     progress(f"training pipeline complete; valid_score={output['valid_score']:.8f}")
     print(json.dumps(output, indent=2))

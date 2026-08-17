@@ -192,6 +192,14 @@ def main():
     if len(names) != load_array(cache_dir, 0, "x").shape[1]:
         raise ValueError("cache feature names do not match matrix width")
     compatibility_checks = {
+        "cache_schema_version": (
+            metadata.get("cache_schema_version")
+            == model_metadata.get("cache_schema_version")
+        ),
+        "input_files": (
+            metadata.get("input_files", [])
+            == model_metadata.get("input_files", [])
+        ),
         "temporal_engine_version": (
             metadata.get("temporal_engine_version")
             == model_metadata.get("temporal_engine_version")
