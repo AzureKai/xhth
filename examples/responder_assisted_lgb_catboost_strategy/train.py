@@ -25,8 +25,11 @@ TIER_RESPONDERS = [
     "responder_22", "responder_23", "responder_21", "responder_42",
     "responder_07", "responder_15", "responder_41", "responder_24",
 ]
-TEMPORAL_ENGINE_VERSION = 3
+TEMPORAL_ENGINE_VERSION = 4
 LGB_PROFILE_VERSION = "low_risk_v1"
+DEFAULT_TEMPORAL_PLAN_PATH = (
+    Path(__file__).resolve().parent / "baseline_468_feature_plan.json"
+)
 
 
 def parse_args():
@@ -39,7 +42,7 @@ def parse_args():
     parser.add_argument("--purge-steps", type=int, default=30)
     parser.add_argument("--warmup-fraction", type=float, default=0.25)
     parser.add_argument("--shard-rows", type=int, default=250_000)
-    parser.add_argument("--temporal-feature-count", type=int, default=30)
+    parser.add_argument("--temporal-feature-count", type=int, default=48)
     parser.add_argument(
         "--feature-importance",
         default="",
@@ -48,7 +51,10 @@ def parse_args():
     parser.add_argument(
         "--temporal-plan",
         default="",
-        help="temporal_feature_plan.json produced by analyze_feature_temporal_types.py",
+        help=(
+            "Optional temporal plan override. By default the frozen "
+            "baseline_468_feature_plan.json is used."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=65_536)
     parser.add_argument(
@@ -220,6 +226,21 @@ def select_temporal_plan(features: list[str], count: int, importance_path: Path 
             for feature, transforms in raw_recipes.items()
             if str(feature) in features and transforms
         }
+        expected_history = [str(value) for value in payload.get("history_features", [])]
+        if payload.get("source_model_feature_count") == 468:
+            if len(expected_history) != 48 or len(set(expected_history)) != 48:
+                raise ValueError(
+                    "baseline 468 plan must contain 48 unique history features"
+                )
+            missing = [value for value in expected_history if value not in features]
+            if missing:
+                raise ValueError(
+                    f"dataset is missing baseline 468 history features: {missing}"
+                )
+            if list(recipes) != expected_history:
+                raise ValueError(
+                    "baseline 468 plan recipes must match history_features order"
+                )
         if recipes:
             from temporal_features import TEMPORAL_SUFFIXES
 
@@ -339,7 +360,7 @@ def build_cache(data_root: Path, cache_dir: Path, shard_rows: int, batch_size: i
             flush()
     flush()
     metadata = {
-        "cache_schema_version": 5,
+        "cache_schema_version": 6,
         "temporal_engine_version": TEMPORAL_ENGINE_VERSION,
         "temporal_plan_hash": temporal_config_hash(
             plan_path, importance_path, temporal_feature_count
@@ -702,6 +723,14 @@ TARGET_EXPERIMENTS = {
     "C": {"temporal_groups": (), "responders": tuple(DEFAULT_RESPONDERS)},
     "D": {"temporal_groups": None, "responders": tuple(DEFAULT_RESPONDERS)},
     "C4": {"temporal_groups": (), "responders": tuple(DEFAULT_RESPONDERS)},
+    "LGB468": {
+        "temporal_groups": ("lag1", "diff1", "rmean5"),
+        "responders": (),
+    },
+    "LGB468_C4": {
+        "temporal_groups": ("lag1", "diff1", "rmean5"),
+        "responders": tuple(DEFAULT_RESPONDERS),
+    },
     "C2": {
         "temporal_groups": (),
         "responders": ("responder_03", "responder_02"),
@@ -817,7 +846,7 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
     elif args.experiment_suite == "legacy":
         names = ["A", "B", "C", "D"]
     elif args.experiment_suite == "next-step":
-        names = ["A", "C4", "C2", "T60", "T20_60", "TZ"]
+        names = ["A", "C4", "LGB468", "LGB468_C4"]
     elif args.experiment_suite == "responder":
         names = [
             "A", "R02", "R03", "R28", "R29",
@@ -836,7 +865,7 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
             "A", "B", "C", "D",
             "R02", "R03", "R28", "R29",
             "C2", "C2_R28", "C2_R29", "C4",
-            "T60", "T20_60", "TZ",
+            "LGB468", "LGB468_C4", "T60", "T20_60", "TZ",
         ]
     unknown = [
         name for name in names
@@ -985,8 +1014,9 @@ def main():
         existing_model_metadata = json.loads(
             (model_dir / "metadata.json").read_text(encoding="utf-8")
         )
-    requested_plan_path = Path(args.temporal_plan) if args.temporal_plan else (
-        Path(__file__).resolve().parent / "analysis" / "temporal_feature_plan.json"
+    requested_plan_path = (
+        Path(args.temporal_plan) if args.temporal_plan
+        else DEFAULT_TEMPORAL_PLAN_PATH
     )
     requested_importance_path = Path(args.feature_importance) if args.feature_importance else (
         Path(__file__).resolve().parent.parent / "lgb_catboost_strategy" / "model" / "feature_importance.csv"
@@ -1048,14 +1078,15 @@ def main():
     importance_path = Path(args.feature_importance) if args.feature_importance else (
         Path(__file__).resolve().parent.parent / "lgb_catboost_strategy" / "model" / "feature_importance.csv"
     )
-    plan_path = Path(args.temporal_plan) if args.temporal_plan else (
-        Path(__file__).resolve().parent / "analysis" / "temporal_feature_plan.json"
+    plan_path = (
+        Path(args.temporal_plan) if args.temporal_plan
+        else DEFAULT_TEMPORAL_PLAN_PATH
     )
     cache_metadata_path = cache_dir / "cache.json"
     if cache_metadata_path.exists():
         existing_metadata = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
         cache_matches = (
-            int(existing_metadata.get("cache_schema_version", 0)) == 5
+            int(existing_metadata.get("cache_schema_version", 0)) == 6
             and int(existing_metadata.get("temporal_engine_version", 0))
             == TEMPORAL_ENGINE_VERSION
             and bool(existing_metadata.get("temporal_recipes"))

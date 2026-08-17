@@ -21,14 +21,18 @@ TEMPORAL_SUFFIXES = [
     "historical_zscore60",
     "xs_rank",
     "xs_rank_delta1",
+    # Baseline-compatible transforms. Keep these at the end so persisted
+    # indices for the older temporal transforms remain stable.
+    "diff1",
+    "rmean5",
 ]
 
-# Default cache routes exclude the two short-horizon transforms that were
-# consistently unimportant. Keep TEMPORAL_SUFFIXES complete so old metadata
-# and explicitly routed plans remain readable.
+# Keep the historical fallback unchanged; the baseline-compatible transforms
+# are enabled explicitly by baseline_468_feature_plan.json. Keep the complete
+# suffix registry so old metadata and explicitly routed plans remain readable.
 DEFAULT_TEMPORAL_SUFFIXES = [
     value for value in TEMPORAL_SUFFIXES
-    if value not in {"delta1", "xs_rank_delta1"}
+    if value not in {"delta1", "xs_rank_delta1", "diff1", "rmean5"}
 ]
 
 
@@ -102,6 +106,9 @@ class TemporalFeatureBuilder:
             "sum60": np.zeros(self.feature_count, dtype=np.float64),
             "sum_sq60": np.zeros(self.feature_count, dtype=np.float64),
             "count60": np.zeros(self.feature_count, dtype=np.int32),
+            # Sum of the previous four cleaned observations. Together with
+            # the current observation this reproduces baseline rmean5.
+            "sum4": np.zeros(self.feature_count, dtype=np.float64),
             "ema5": np.full(self.feature_count, np.nan, dtype=np.float32),
             "ema20": np.full(self.feature_count, np.nan, dtype=np.float32),
             "ema60": np.full(self.feature_count, np.nan, dtype=np.float32),
@@ -113,7 +120,9 @@ class TemporalFeatureBuilder:
         if values.shape[1] != self.feature_count:
             raise ValueError("temporal feature count does not match state")
         ranks = cross_section_rank(values)
-        output = np.zeros((len(values), self.feature_count * len(TEMPORAL_SUFFIXES)), dtype=np.float32)
+        full_width = self.feature_count * len(TEMPORAL_SUFFIXES)
+        output_width = full_width if self.output_indices is None else len(self.output_indices)
+        output = np.zeros((len(values), output_width), dtype=np.float32)
 
         for row, asset_value in enumerate(asset_ids):
             asset_id = int(asset_value)
@@ -140,6 +149,15 @@ class TemporalFeatureBuilder:
             ema20 = state["ema20"].copy()
             ema60 = state["ema60"].copy()
             previous_rank = state["xs_rank"].copy()
+            clean_current = np.nan_to_num(
+                current, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            clean_lag1 = np.nan_to_num(
+                lag1, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            rmean5 = (
+                state["sum4"] + clean_current
+            ) / float(min(steps, 4) + 1)
 
             matrix = np.column_stack(
                 [
@@ -160,9 +178,18 @@ class TemporalFeatureBuilder:
                     np.divide(current - mean60, std60, out=np.zeros(self.feature_count), where=std60 > 1e-6),
                     ranks[row],
                     ranks[row] - previous_rank,
+                    clean_current - clean_lag1,
+                    rmean5,
                 ]
             )
-            output[row] = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+            row_output = np.nan_to_num(
+                matrix, nan=0.0, posinf=0.0, neginf=0.0
+            ).reshape(-1)
+            output[row] = (
+                row_output
+                if self.output_indices is None
+                else row_output[self.output_indices]
+            )
 
             old60 = buffer[position].copy()
             old60_valid = np.isfinite(old60) & (steps >= self.window)
@@ -174,6 +201,12 @@ class TemporalFeatureBuilder:
             state["sum20"][old20_valid] -= old20[old20_valid]
             state["sum_sq20"][old20_valid] -= old20[old20_valid] * old20[old20_valid]
             state["count20"][old20_valid] -= 1
+            if steps >= 4:
+                old4 = buffer[(position - 4) % self.window].copy()
+                state["sum4"] -= np.nan_to_num(
+                    old4, nan=0.0, posinf=0.0, neginf=0.0
+                )
+            state["sum4"] += clean_current
             current_valid = np.isfinite(current)
             buffer[position] = current
             for suffix in ("20", "60"):
@@ -189,4 +222,4 @@ class TemporalFeatureBuilder:
                 previous[initialize] = current[initialize]
                 previous[update] = alpha * current[update] + (1.0 - alpha) * previous[update]
             state["xs_rank"] = ranks[row].copy()
-        return output if self.output_indices is None else output[:, self.output_indices]
+        return output

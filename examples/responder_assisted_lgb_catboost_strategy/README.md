@@ -7,6 +7,7 @@
 - `train.py`：缓存预处理、OOF responder、target 消融和最终模型训练。
 - `main.py`：时序 API 推理入口。
 - `temporal_features.py`：严格历史时序特征状态机。
+- `baseline_468_feature_plan.json`：从强 baseline 冻结下来的 48 个历史源特征及变换配方。
 - `screen_all_responders.py`：对原始数据中的全部 responder 做潜力筛选。
 - `analyze_responders.py`：分析 responder 与 target 的相关性和时间稳定性。
 - `analyze_feature_temporal_types.py`：判断 feature 适合的时序变换类型。
@@ -75,7 +76,14 @@ python3 examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py 
 python3 examples/responder_assisted_lgb_catboost_strategy/analyze_feature_temporal_types.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
 ```
 
-训练脚本默认读取 `analysis/temporal_feature_plan.json`。若文件不存在，则对选中的原始特征使用默认时序变换；默认已排除低价值的 `delta1` 和 `xs_rank_delta1`。
+`analyze_feature_temporal_types.py` 仍可生成探索性路由，但正式训练默认读取 `baseline_468_feature_plan.json`。该固定计划复用 `lightgbm_baseline/model_forward_lowrisk_v3` 选出的 48 个历史源特征，并严格生成 `lag1`、`diff1`、`rmean5` 三组特征：
+
+- 323 个原始 feature。
+- 48 × 3 = 144 个历史衍生 feature。
+- 1 个 categorical `asset_id`。
+- 合计 468 个 LightGBM 基础输入；再加入四个 OOF `responder_hat` 后，target 输入为 472 列。
+
+如需继续试验分析器生成的路由，可显式传入 `--temporal-plan examples/responder_assisted_lgb_catboost_strategy/analysis/temporal_feature_plan.json`。
 
 ### 5. 训练模型
 
@@ -120,16 +128,16 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 默认 `--experiment-suite next-step` 训练：
 
 - `A`：原始特征。
-- `C4`：原始特征加四个 responder_hat。
-- `C2`：原始特征加 responder_02/03。
-- `T60`：C2 加60期波动率和 EMA 偏离。
-- `T20_60`：C2 加20/60期波动率和 EMA 偏离。
-- `TZ`：T20_60 加20/60期历史 z-score。
+- `C4`：原始特征加四个 responder_hat；responder 模型本身使用完整 468 列基础输入。
+- `LGB468`：baseline 的 468 列特征，不加入 responder_hat。
+- `LGB468_C4`：baseline 的 468 列特征加四个 OOF responder_hat，共 472 列。
+
+这一组构成 2×2 对照，可分别判断 baseline 时序特征和 responder stacking 的独立增量及联合效果。验证分数最高的可部署实验仍会用于最终三种子重训。
 
 只训练指定实验：
 
 ```powershell
-python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --target-experiments C2,T60,T20_60 --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --target-experiments LGB468,LGB468_C4 --threads 8
 ```
 
 原始 A/B/C/D 套件：
