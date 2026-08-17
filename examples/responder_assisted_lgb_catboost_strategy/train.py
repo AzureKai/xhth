@@ -1075,6 +1075,12 @@ def main():
         if (work_dir / "oof_models").exists():
             progress("removing OOF models because the cache is being rebuilt")
             shutil.rmtree(work_dir / "oof_models")
+        if (work_dir / "selection_responder_models").exists():
+            progress(
+                "removing selection responder models because the cache is "
+                "being rebuilt"
+            )
+            shutil.rmtree(work_dir / "selection_responder_models")
     importance_path = Path(args.feature_importance) if args.feature_importance else (
         Path(__file__).resolve().parent.parent / "lgb_catboost_strategy" / "model" / "feature_importance.csv"
     )
@@ -1099,6 +1105,8 @@ def main():
             shutil.rmtree(cache_dir)
             if (work_dir / "oof_models").exists():
                 shutil.rmtree(work_dir / "oof_models")
+            if (work_dir / "selection_responder_models").exists():
+                shutil.rmtree(work_dir / "selection_responder_models")
     if cache_metadata_path.exists():
         progress(f"loading existing cache metadata: {cache_dir / 'cache.json'}")
         metadata = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
