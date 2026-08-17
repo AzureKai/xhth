@@ -49,6 +49,9 @@ examples/responder_assisted_lgb_catboost_strategy/work_single_responder/
 examples/responder_assisted_lgb_catboost_strategy/model_single_responder/
 examples/responder_assisted_lgb_catboost_strategy/model_c4_mechanism/
 examples/responder_assisted_lgb_catboost_strategy/submission.csv
+examples/responder_assisted_lgb_catboost_strategy/.pull_staging/
+examples/**/pull_remote_results.*
+examples/responder_assisted_lgb_catboost_strategy/validate_model_artifacts.ps1
 examples/lgb_tcn_ensemble_strategy/work/
 examples/lgb_tcn_ensemble_strategy/model/
 examples/lgb_tcn_ensemble_strategy/submission.csv

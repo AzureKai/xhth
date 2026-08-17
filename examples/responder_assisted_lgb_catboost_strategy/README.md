@@ -11,7 +11,6 @@
 - `analyze_responders.py`：分析 responder 与 target 的相关性和时间稳定性。
 - `analyze_feature_temporal_types.py`：判断 feature 适合的时序变换类型。
 - `audit_responders.py`：审计 responder 可预测性、均值基线和模型缓存一致性。
-- `pull_remote_results.bat`：从远程训练机传回模型、分析与提交文件。
 - `work/`：缓存、OOF 模型和中间文件，不应提交 Git。
 - `model/`：最终模型、metadata、消融报告和特征重要性。
 - `analysis/`：responder 与时序特征分析结果。
@@ -186,22 +185,6 @@ python3 timeseries_api/run_timeseries_api.py --data-root data --strategy-dir exa
 ```
 
 推理严格要求 `time_id` 递增。模型先更新历史时序状态，再预测需要的 responder_hat，最后预测 target。
-
-### 9. 从远程电脑传回结果
-
-默认远程仓库为 `ustc-lab:~/xhth`：
-
-```bat
-examples\responder_assisted_lgb_catboost_strategy\pull_remote_results.bat
-```
-
-覆盖远程主机和路径：
-
-```bat
-examples\responder_assisted_lgb_catboost_strategy\pull_remote_results.bat HOST REMOTE_REPO
-```
-
-脚本传回 `model/`、`model_single_responder/`、`audit/`、`analysis/`、`submission.csv`，并尝试传回普通训练和单 responder 训练的 `oof_models/`、`oof_responder_hat.dat` 与 `cache.json`。巨大的 `work/cache/shard_*` 数组不会传输。
 
 ## 进度显示
 

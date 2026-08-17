@@ -67,12 +67,6 @@ python3 examples/lgb_tcn_ensemble_strategy/train_pipeline.py --data-root data --
 
 训练期间会显示四阶段流水线状态、feature 筛选比例、target OOF 折进度、Parquet 读取比例、每个 epoch 的批次比例和实时加权损失、校准预测比例、最终评估预测比例以及每轮融合后的校准 R²。
 
-远程训练完成后回传：
-
-```bat
-examples\lgb_tcn_ensemble_strategy\pull_remote_results.bat
-```
-
 ## 3. 推理
 
 ```powershell
