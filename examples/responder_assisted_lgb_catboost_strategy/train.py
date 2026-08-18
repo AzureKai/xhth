@@ -29,7 +29,7 @@ TEMPORAL_ENGINE_VERSION = 4
 CACHE_SCHEMA_VERSION = 7
 LGB_PROFILE_VERSION = "walk_forward_v2"
 DEFAULT_TEMPORAL_PLAN_PATH = (
-    Path(__file__).resolve().parent / "baseline_468_feature_plan.json"
+    Path(__file__).resolve().parent / "long_horizon_468_feature_plan.json"
 )
 TARGET_PARAM_PROFILES = {
     "smoothed": {
@@ -80,8 +80,8 @@ def parse_args():
         "--temporal-plan",
         default="",
         help=(
-            "Optional temporal plan override. By default the frozen "
-            "baseline_468_feature_plan.json is used."
+            "Optional temporal plan override. By default the fixed-width "
+            "long_horizon_468_feature_plan.json is used."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=65_536)
@@ -274,41 +274,59 @@ def select_temporal_plan(features: list[str], count: int, importance_path: Path 
         if payload.get("source_model_feature_count") == 468:
             if len(expected_history) != 48 or len(set(expected_history)) != 48:
                 raise ValueError(
-                    "baseline 468 plan must contain 48 unique history features"
+                    "468-column plan must contain 48 unique history features"
                 )
             missing = [value for value in expected_history if value not in features]
             if missing:
                 raise ValueError(
-                    f"dataset is missing baseline 468 history features: {missing}"
+                    f"dataset is missing 468-plan history features: {missing}"
                 )
             if list(recipes) != expected_history:
                 raise ValueError(
-                    "baseline 468 plan recipes must match history_features order"
+                    "468-column plan recipes must match history_features order"
                 )
         if recipes:
             from temporal_features import TEMPORAL_SUFFIXES
 
             for feature, transforms in recipes.items():
+                unknown = [
+                    value for value in transforms
+                    if value not in TEMPORAL_SUFFIXES
+                    and value not in {"delta1", "xs_rank_delta1"}
+                ]
+                if unknown and payload.get("exact_recipes", False):
+                    raise ValueError(
+                        f"exact temporal plan has unsupported transforms for "
+                        f"{feature}: {unknown}"
+                    )
                 migrated = [
                     value for value in transforms
                     if value not in {"delta1", "xs_rank_delta1"}
                     and value in TEMPORAL_SUFFIXES
                 ]
-                additions = []
-                if "lag5" in migrated or "ema20" in migrated:
-                    additions.extend(["lag20", "ema60"])
-                if "delta5" in migrated:
-                    additions.append("delta20")
-                if "rolling_std20" in migrated:
-                    additions.append("rolling_std60")
-                if "historical_zscore20" in migrated:
-                    additions.append("historical_zscore60")
-                if "minus_ema20" in migrated:
-                    additions.append("minus_ema60")
-                for value in additions:
-                    if value not in migrated:
-                        migrated.append(value)
+                if not payload.get("exact_recipes", False):
+                    additions = []
+                    if "lag5" in migrated or "ema20" in migrated:
+                        additions.extend(["lag20", "ema60"])
+                    if "delta5" in migrated:
+                        additions.append("delta20")
+                    if "rolling_std20" in migrated:
+                        additions.append("rolling_std60")
+                    if "historical_zscore20" in migrated:
+                        additions.append("historical_zscore60")
+                    if "minus_ema20" in migrated:
+                        additions.append("minus_ema60")
+                    for value in additions:
+                        if value not in migrated:
+                            migrated.append(value)
                 recipes[feature] = migrated
+            if (
+                payload.get("source_model_feature_count") == 468
+                and sum(map(len, recipes.values())) != 144
+            ):
+                raise ValueError(
+                    "468-column plan must resolve to exactly 144 temporal columns"
+                )
             progress(
                 f"loaded temporal routing plan: {plan_path}; "
                 f"features={len(recipes)}, derived={sum(map(len, recipes.values()))}"
@@ -966,11 +984,17 @@ TARGET_EXPERIMENTS = {
     "D": {"temporal_groups": None, "responders": tuple(DEFAULT_RESPONDERS)},
     "C4": {"temporal_groups": (), "responders": tuple(DEFAULT_RESPONDERS)},
     "LGB468": {
-        "temporal_groups": ("lag1", "diff1", "rmean5"),
+        "temporal_groups": (
+            "rmean5", "historical_zscore20", "minus_ema20",
+            "rolling_std20", "lag1", "diff1",
+        ),
         "responders": (),
     },
     "LGB468_C4": {
-        "temporal_groups": ("lag1", "diff1", "rmean5"),
+        "temporal_groups": (
+            "rmean5", "historical_zscore20", "minus_ema20",
+            "rolling_std20", "lag1", "diff1",
+        ),
         "responders": tuple(DEFAULT_RESPONDERS),
     },
     "C2": {

@@ -30,6 +30,7 @@ from train import (
     clipping_diagnostics,
     matrix_for_segments,
     low_risk_lgb_params,
+    select_temporal_plan,
     session_patch,
     target_experiment_spec,
     temporal_session_warmup,
@@ -52,9 +53,9 @@ class Baseline468FeatureTests(unittest.TestCase):
         self.assertEqual(params["histogram_pool_size"], 8192.0)
         self.assertNotIn("regularization_rank", params)
 
-    def test_plan_has_exact_468_base_columns(self):
+    def test_long_horizon_plan_has_exact_468_base_columns(self):
         payload = json.loads(
-            (STRATEGY_DIR / "baseline_468_feature_plan.json").read_text(
+            (STRATEGY_DIR / "long_horizon_468_feature_plan.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -64,9 +65,21 @@ class Baseline468FeatureTests(unittest.TestCase):
         self.assertEqual(len(history_features), 48)
         self.assertEqual(len(set(history_features)), 48)
         self.assertEqual(list(recipes), history_features)
-        self.assertTrue(
-            all(value == ["lag1", "diff1", "rmean5"] for value in recipes.values())
+        self.assertTrue(payload["exact_recipes"])
+        self.assertTrue(all("rmean5" in value for value in recipes.values()))
+        self.assertEqual(sum("lag1" in value for value in recipes.values()), 8)
+        self.assertEqual(sum("diff1" in value for value in recipes.values()), 7)
+        for transform in (
+            "historical_zscore20", "minus_ema20", "rolling_std20"
+        ):
+            self.assertEqual(
+                sum(transform in value for value in recipes.values()), 27
+            )
+        self.assertFalse(
+            any("historical_zscore60" in value for value in recipes.values())
         )
+        self.assertFalse(any("minus_ema60" in value for value in recipes.values()))
+        self.assertFalse(any("rolling_std60" in value for value in recipes.values()))
         self.assertEqual(len(temporal_column_names(history_features, recipes)), 144)
         self.assertEqual(323 + 144 + 1, payload["source_model_feature_count"])
         self.assertEqual(323 + 144 + 1 + 4, 472)
@@ -84,6 +97,24 @@ class Baseline468FeatureTests(unittest.TestCase):
         self.assertEqual(len(spec["responder_indices"]), 4)
         self.assertEqual(len(spec["feature_names"]), 472)
 
+    def test_exact_plan_loader_does_not_add_60_step_transforms(self):
+        features = [f"feature_{index:03d}" for index in range(323)]
+        plan_path = STRATEGY_DIR / "long_horizon_468_feature_plan.json"
+        selected, recipes = select_temporal_plan(
+            features, 48, importance_path=None, plan_path=plan_path
+        )
+        self.assertEqual(len(selected), 48)
+        self.assertEqual(sum(map(len, recipes.values())), 144)
+        flattened = {value for transforms in recipes.values() for value in transforms}
+        self.assertFalse(
+            flattened.intersection(
+                {"historical_zscore60", "minus_ema60", "rolling_std60"}
+            )
+        )
+        # minus_ema20 is recursive: exact validation cold starts must rebuild
+        # the complete session rather than only the first 20 time steps.
+        self.assertEqual(temporal_session_warmup(recipes), -1)
+
     def test_history_transforms_match_baseline_cold_start_and_rolling_mean(self):
         recipes = {"feature_000": ["lag1", "diff1", "rmean5"]}
         builder = TemporalFeatureBuilder(
@@ -99,6 +130,30 @@ class Baseline468FeatureTests(unittest.TestCase):
                 [3.0, 1.0, 2.5],
                 [4.0, 1.0, 3.0],
                 [5.0, 1.0, 4.0],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+
+    def test_long_horizon_transforms_use_only_previous_observations(self):
+        recipes = {
+            "feature_000": [
+                "rmean5", "historical_zscore20", "minus_ema20",
+                "rolling_std20",
+            ]
+        }
+        builder = TemporalFeatureBuilder(
+            1, feature_names=["feature_000"], recipes=recipes
+        )
+        actual = builder.transform(
+            np.ones(3, dtype=np.int64),
+            np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32),
+        )
+        expected = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [1.5, 0.0, 1.0, 0.0],
+                [2.0, 3.0, 3.0 - (1.0 + 2.0 / 21.0), 0.5],
             ],
             dtype=np.float32,
         )

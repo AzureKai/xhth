@@ -1,0 +1,359 @@
+{
+  "description": "Fixed-width long-horizon revision of the baseline 468 plan: retain rmean5 for all 48 sources, retain only top old lag1/diff1 features, and route 27 sources through three strictly historical 20-step transforms.",
+  "source_model_feature_count": 468,
+  "exact_recipes": true,
+  "selection": {
+    "importance_variants": [
+      "LGB468",
+      "LGB468_C4"
+    ],
+    "short_top_per_variant": 5,
+    "retained_lag1": [
+      "feature_039",
+      "feature_093",
+      "feature_096",
+      "feature_099",
+      "feature_111",
+      "feature_129",
+      "feature_228",
+      "feature_284"
+    ],
+    "retained_diff1": [
+      "feature_000",
+      "feature_111",
+      "feature_117",
+      "feature_124",
+      "feature_129",
+      "feature_228",
+      "feature_287"
+    ],
+    "long_feature_count": 27,
+    "long_features_ranked": [
+      "feature_228",
+      "feature_284",
+      "feature_111",
+      "feature_099",
+      "feature_034",
+      "feature_096",
+      "feature_129",
+      "feature_090",
+      "feature_124",
+      "feature_286",
+      "feature_093",
+      "feature_127",
+      "feature_095",
+      "feature_287",
+      "feature_117",
+      "feature_036",
+      "feature_276",
+      "feature_000",
+      "feature_305",
+      "feature_318",
+      "feature_144",
+      "feature_244",
+      "feature_013",
+      "feature_039",
+      "feature_008",
+      "feature_045",
+      "feature_321"
+    ],
+    "long_transforms": [
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "derived_feature_count": 144
+  },
+  "history_features": [
+    "feature_050",
+    "feature_151",
+    "feature_015",
+    "feature_008",
+    "feature_271",
+    "feature_286",
+    "feature_144",
+    "feature_042",
+    "feature_321",
+    "feature_047",
+    "feature_248",
+    "feature_308",
+    "feature_135",
+    "feature_305",
+    "feature_157",
+    "feature_129",
+    "feature_284",
+    "feature_039",
+    "feature_045",
+    "feature_148",
+    "feature_014",
+    "feature_096",
+    "feature_287",
+    "feature_263",
+    "feature_000",
+    "feature_313",
+    "feature_188",
+    "feature_124",
+    "feature_090",
+    "feature_095",
+    "feature_034",
+    "feature_127",
+    "feature_311",
+    "feature_318",
+    "feature_099",
+    "feature_228",
+    "feature_036",
+    "feature_013",
+    "feature_244",
+    "feature_093",
+    "feature_256",
+    "feature_316",
+    "feature_078",
+    "feature_003",
+    "feature_266",
+    "feature_117",
+    "feature_276",
+    "feature_111"
+  ],
+  "recipes": {
+    "feature_050": [
+      "rmean5"
+    ],
+    "feature_151": [
+      "rmean5"
+    ],
+    "feature_015": [
+      "rmean5"
+    ],
+    "feature_008": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_271": [
+      "rmean5"
+    ],
+    "feature_286": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_144": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_042": [
+      "rmean5"
+    ],
+    "feature_321": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_047": [
+      "rmean5"
+    ],
+    "feature_248": [
+      "rmean5"
+    ],
+    "feature_308": [
+      "rmean5"
+    ],
+    "feature_135": [
+      "rmean5"
+    ],
+    "feature_305": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_157": [
+      "rmean5"
+    ],
+    "feature_129": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1",
+      "diff1"
+    ],
+    "feature_284": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1"
+    ],
+    "feature_039": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1"
+    ],
+    "feature_045": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_148": [
+      "rmean5"
+    ],
+    "feature_014": [
+      "rmean5"
+    ],
+    "feature_096": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1"
+    ],
+    "feature_287": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "diff1"
+    ],
+    "feature_263": [
+      "rmean5"
+    ],
+    "feature_000": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "diff1"
+    ],
+    "feature_313": [
+      "rmean5"
+    ],
+    "feature_188": [
+      "rmean5"
+    ],
+    "feature_124": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "diff1"
+    ],
+    "feature_090": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_095": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_034": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_127": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_311": [
+      "rmean5"
+    ],
+    "feature_318": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_099": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1"
+    ],
+    "feature_228": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1",
+      "diff1"
+    ],
+    "feature_036": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_013": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_244": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_093": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1"
+    ],
+    "feature_256": [
+      "rmean5"
+    ],
+    "feature_316": [
+      "rmean5"
+    ],
+    "feature_078": [
+      "rmean5"
+    ],
+    "feature_003": [
+      "rmean5"
+    ],
+    "feature_266": [
+      "rmean5"
+    ],
+    "feature_117": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "diff1"
+    ],
+    "feature_276": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20"
+    ],
+    "feature_111": [
+      "rmean5",
+      "historical_zscore20",
+      "minus_ema20",
+      "rolling_std20",
+      "lag1",
+      "diff1"
+    ]
+  }
+}

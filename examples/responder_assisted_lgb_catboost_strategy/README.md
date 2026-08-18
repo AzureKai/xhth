@@ -7,7 +7,9 @@
 - `train.py`：缓存预处理、OOF responder、target 消融和最终模型训练。
 - `main.py`：时序 API 推理入口。
 - `temporal_features.py`：严格历史时序特征状态机。
-- `baseline_468_feature_plan.json`：从强 baseline 冻结下来的 48 个历史源特征及变换配方。
+- `baseline_468_feature_plan.json`：上一轮强 baseline 的原始 48×3 时序配方，保留作对照。
+- `long_horizon_468_feature_plan.json`：当前默认的固定 468 列长期时序配方。
+- `build_long_horizon_plan.py`：根据上一轮特征重要性重建长期配方。
 - `screen_all_responders.py`：对原始数据中的全部 responder 做潜力筛选。
 - `analyze_responders.py`：分析 responder 与 target 的相关性和时间稳定性。
 - `analyze_feature_temporal_types.py`：判断 feature 适合的时序变换类型。
@@ -76,12 +78,21 @@ python3 examples/responder_assisted_lgb_catboost_strategy/analyze_responders.py 
 python3 examples/responder_assisted_lgb_catboost_strategy/analyze_feature_temporal_types.py --data-root data --output-dir examples/responder_assisted_lgb_catboost_strategy/analysis
 ```
 
-`analyze_feature_temporal_types.py` 仍可生成探索性路由，但正式训练默认读取 `baseline_468_feature_plan.json`。该固定计划复用 `lightgbm_baseline/model_forward_lowrisk_v3` 选出的 48 个历史源特征，并严格生成 `lag1`、`diff1`、`rmean5` 三组特征：
+`analyze_feature_temporal_types.py` 仍可生成探索性路由。正式训练默认读取 `long_horizon_468_feature_plan.json`。它继续使用 `lightgbm_baseline/model_forward_lowrisk_v3` 选出的 48 个历史源特征，但根据上一轮 `LGB468/LGB468_C4` 的 gain 重要性压缩短期特征，并把容量转给 20 步长特征：
 
 - 323 个原始 feature。
-- 48 × 3 = 144 个历史衍生 feature。
+- 48 个 `rmean5`，每个历史源特征均保留。
+- 在旧 `LGB468` 与 `LGB468_C4` 中分别取 gain 最高的 5 个 `lag1/diff1`，合并去重后保留 8 个 `lag1` 和 7 个 `diff1`。
+- 按两个模型内归一化后的时序总 gain 选择 27 个源特征，每个生成 `historical_zscore20`、`minus_ema20`、`rolling_std20`，共 81 列。
+- 历史衍生列仍为 48 + 8 + 7 + 81 = 144，因此实验维度保持不变。
 - 1 个 categorical `asset_id`。
 - 合计 468 个 LightGBM 基础输入；再加入四个 OOF `responder_hat` 后，target 输入为 472 列。
+
+固定宽度使新旧实验的模型容量更可比。配方中的 `exact_recipes=true` 会阻止加载器自动追加对应的 60 步长变换。需要使用新的重要性报告重新冻结配方时运行：
+
+```powershell
+python3 examples/responder_assisted_lgb_catboost_strategy/build_long_horizon_plan.py --importance examples/responder_assisted_lgb_catboost_strategy/model/target_feature_importance.csv --base-plan examples/responder_assisted_lgb_catboost_strategy/baseline_468_feature_plan.json --output examples/responder_assisted_lgb_catboost_strategy/long_horizon_468_feature_plan.json
+```
 
 如需继续试验分析器生成的路由，可显式传入 `--temporal-plan examples/responder_assisted_lgb_catboost_strategy/analysis/temporal_feature_plan.json`。
 
@@ -105,7 +116,7 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 
 - 将 `asset_id` 作为 categorical feature，而不是普通连续数值。
 - 保留最后 15% 时间作为 terminal holdout；前 85% 内部使用 expanding-window OOF，并在每个边界加入 30 个观测时点的 purge。
-- 每个 OOF 验证折和 terminal holdout 都从空时序状态启动，严格模拟测试 API 冷启动。默认 5 期历史计划只需重建会话前 5 个 `time_id`。
+- 每个 OOF 验证折和 terminal holdout 都从空时序状态启动，严格模拟测试 API 冷启动。`historical_zscore20` 和 `rolling_std20` 只依赖前 20 期，但 `minus_ema20` 是递归状态；为保证完全无泄漏，当前长期计划会重建整个验证会话的时序列，而不是只修补前 20 个 `time_id`。
 - 先在 `LGB468` 上比较 `smoothed/reference/guarded` 三个预注册 LightGBM 参数组，再用胜出参数对所有 target 变体做 walk-forward 比较；参数和变体均按多折平均分选择，而不是按 terminal holdout 排名。
 - target 晋级同时要求 OOF、holdout 和预测尺度合理；复杂变体还必须在平均折、至少 80% 可评估折、最新折和 holdout 上击败更简单的父模型。默认套件在 CV 冻结后只让 CV 冠军及其必要父模型进入 terminal holdout；专项诊断套件才会评估全部变体。
 - 预测裁剪边界只用 OOF 预测拟合，并且只有 OOF 与 holdout 都不变差时才在部署中启用。报告同时保存原始、裁剪和最终部署分数。
@@ -133,15 +144,15 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 
 - `A`：原始特征。
 - `C4`：原始特征加四个 responder_hat；responder 模型本身使用完整 468 列基础输入。
-- `LGB468`：baseline 的 468 列特征，不加入 responder_hat。
-- `LGB468_C4`：baseline 的 468 列特征加四个 OOF responder_hat，共 472 列。
+- `LGB468`：当前固定宽度长期计划的 468 列特征，不加入 responder_hat。
+- `LGB468_C4`：同一组 468 列特征加四个 OOF responder_hat，共 472 列。
 
 这一组构成 2×2 对照，可分别判断 baseline 时序特征和 responder stacking 的独立增量及联合效果。变体首先按 development walk-forward 平均分排序，然后经过 terminal holdout 晋级门槛；holdout 不直接用于挑选最高分。
 
-只训练指定实验：
+重建时序缓存并重新运行完整 2×2 对照（推荐；A/C4 是判断长期特征增量所需的父模型）：
 
 ```powershell
-python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --target-experiments LGB468,LGB468_C4 --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --temporal-plan examples/responder_assisted_lgb_catboost_strategy/long_horizon_468_feature_plan.json --target-experiments A,C4,LGB468,LGB468_C4 --rebuild-cache --threads 8
 ```
 
 原始 A/B/C/D 套件：
