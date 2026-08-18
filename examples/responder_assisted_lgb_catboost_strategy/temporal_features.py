@@ -84,16 +84,17 @@ class TemporalFeatureBuilder:
         self.states: dict[int, dict[str, np.ndarray | int]] = {}
         self.feature_names = feature_names
         self.recipes = recipes
-        self.output_indices = None
+        self.output_routes: list[tuple[int, str]] | None = None
+        self.requested_transforms = set(TEMPORAL_SUFFIXES)
         if feature_names is not None and recipes is not None:
-            self.output_indices = np.asarray(
-                [
-                    feature_index * len(TEMPORAL_SUFFIXES) + TEMPORAL_SUFFIXES.index(suffix)
-                    for feature_index, feature in enumerate(feature_names)
-                    for suffix in recipes.get(feature, [])
-                ],
-                dtype=np.int64,
-            )
+            self.output_routes = [
+                (feature_index, suffix)
+                for feature_index, feature in enumerate(feature_names)
+                for suffix in recipes.get(feature, [])
+            ]
+            self.requested_transforms = {
+                suffix for _, suffix in self.output_routes
+            }
 
     def _new_state(self):
         return {
@@ -119,9 +120,20 @@ class TemporalFeatureBuilder:
         values = np.asarray(values, dtype=np.float32)
         if values.shape[1] != self.feature_count:
             raise ValueError("temporal feature count does not match state")
-        ranks = cross_section_rank(values)
+        needs_ranks = bool(
+            self.requested_transforms.intersection(
+                {"xs_rank", "xs_rank_delta1"}
+            )
+        )
+        ranks = (
+            cross_section_rank(values)
+            if needs_ranks else np.zeros_like(values, dtype=np.float32)
+        )
         full_width = self.feature_count * len(TEMPORAL_SUFFIXES)
-        output_width = full_width if self.output_indices is None else len(self.output_indices)
+        output_width = (
+            full_width
+            if self.output_routes is None else len(self.output_routes)
+        )
         output = np.zeros((len(values), output_width), dtype=np.float32)
 
         for row, asset_value in enumerate(asset_ids):
@@ -159,36 +171,48 @@ class TemporalFeatureBuilder:
                 state["sum4"] + clean_current
             ) / float(min(steps, 4) + 1)
 
-            matrix = np.column_stack(
-                [
-                    lag1,
-                    lag5,
-                    lag20,
-                    current - lag1,
-                    current - lag5,
-                    current - lag20,
-                    ema5,
-                    ema20,
-                    ema60,
-                    current - ema20,
-                    current - ema60,
-                    std20,
-                    std60,
-                    np.divide(current - mean20, std20, out=np.zeros(self.feature_count), where=std20 > 1e-6),
-                    np.divide(current - mean60, std60, out=np.zeros(self.feature_count), where=std60 > 1e-6),
-                    ranks[row],
-                    ranks[row] - previous_rank,
-                    clean_current - clean_lag1,
-                    rmean5,
-                ]
-            )
-            row_output = np.nan_to_num(
-                matrix, nan=0.0, posinf=0.0, neginf=0.0
-            ).reshape(-1)
-            output[row] = (
-                row_output
-                if self.output_indices is None
-                else row_output[self.output_indices]
+            transform_values = {
+                "lag1": lag1,
+                "lag5": lag5,
+                "lag20": lag20,
+                "delta1": current - lag1,
+                "delta5": current - lag5,
+                "delta20": current - lag20,
+                "ema5": ema5,
+                "ema20": ema20,
+                "ema60": ema60,
+                "minus_ema20": current - ema20,
+                "minus_ema60": current - ema60,
+                "rolling_std20": std20,
+                "rolling_std60": std60,
+                "historical_zscore20": np.divide(
+                    current - mean20, std20,
+                    out=np.zeros(self.feature_count), where=std20 > 1e-6,
+                ),
+                "historical_zscore60": np.divide(
+                    current - mean60, std60,
+                    out=np.zeros(self.feature_count), where=std60 > 1e-6,
+                ),
+                "xs_rank": ranks[row],
+                "xs_rank_delta1": ranks[row] - previous_rank,
+                "diff1": clean_current - clean_lag1,
+                "rmean5": rmean5,
+            }
+            if self.output_routes is None:
+                row_output = np.concatenate(
+                    [transform_values[suffix] for suffix in TEMPORAL_SUFFIXES]
+                ).reshape(len(TEMPORAL_SUFFIXES), self.feature_count).T.reshape(-1)
+            else:
+                row_output = np.fromiter(
+                    (
+                        transform_values[suffix][feature_index]
+                        for feature_index, suffix in self.output_routes
+                    ),
+                    dtype=np.float32,
+                    count=len(self.output_routes),
+                )
+            output[row] = np.nan_to_num(
+                row_output, nan=0.0, posinf=0.0, neginf=0.0
             )
 
             old60 = buffer[position].copy()

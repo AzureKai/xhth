@@ -29,6 +29,9 @@ TEMPORAL_ENGINE_VERSION = 4
 CACHE_SCHEMA_VERSION = 7
 LGB_PROFILE_VERSION = "walk_forward_v2"
 DEFAULT_TEMPORAL_PLAN_PATH = (
+    Path(__file__).resolve().parent / "all_feature_long_horizon_plan.json"
+)
+COMPACT_TEMPORAL_PLAN_PATH = (
     Path(__file__).resolve().parent / "long_horizon_468_feature_plan.json"
 )
 TARGET_PARAM_PROFILES = {
@@ -56,6 +59,18 @@ TARGET_PARAM_PROFILES = {
 }
 
 
+def fixed_plan_temporal_columns(path: Path) -> tuple[str, ...]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    features = list(payload["history_features"])
+    recipes = dict(payload["recipes"])
+    return tuple(temporal_column_names(features, recipes))
+
+
+COMPACT_468_TEMPORAL_COLUMNS = fixed_plan_temporal_columns(
+    COMPACT_TEMPORAL_PLAN_PATH
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Out-of-core responder-stacked LightGBM")
     parser.add_argument("--data-root", required=True)
@@ -80,8 +95,8 @@ def parse_args():
         "--temporal-plan",
         default="",
         help=(
-            "Optional temporal plan override. By default the fixed-width "
-            "long_horizon_468_feature_plan.json is used."
+            "Optional temporal plan override. By default the all-feature "
+            "all_feature_long_horizon_plan.json is used."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=65_536)
@@ -149,6 +164,14 @@ def parse_args():
         "--skip-existing-models",
         action="store_true",
         help="Load model files that already exist and train only missing models.",
+    )
+    parser.add_argument(
+        "--allow-control-deployment",
+        action="store_true",
+        help=(
+            "Allow a control-only diagnostic suite to refit a final model. "
+            "By default only LGB468_C4 and registered improvements may deploy."
+        ),
     )
     return parser.parse_args()
 
@@ -320,16 +343,21 @@ def select_temporal_plan(features: list[str], count: int, importance_path: Path 
                         if value not in migrated:
                             migrated.append(value)
                 recipes[feature] = migrated
+            derived_count = sum(map(len, recipes.values()))
+            expected_base_count = payload.get("source_model_feature_count")
             if (
-                payload.get("source_model_feature_count") == 468
-                and sum(map(len, recipes.values())) != 144
+                expected_base_count is not None
+                and len(features) + derived_count + 1
+                != int(expected_base_count)
             ):
                 raise ValueError(
-                    "468-column plan must resolve to exactly 144 temporal columns"
+                    "temporal plan width does not match source_model_feature_count: "
+                    f"raw={len(features)}, derived={derived_count}, "
+                    f"expected_base={expected_base_count}"
                 )
             progress(
                 f"loaded temporal routing plan: {plan_path}; "
-                f"features={len(recipes)}, derived={sum(map(len, recipes.values()))}"
+                f"features={len(recipes)}, derived={derived_count}"
             )
             return list(recipes), recipes
     selected = select_temporal_features(features, count, importance_path)
@@ -984,18 +1012,22 @@ TARGET_EXPERIMENTS = {
     "D": {"temporal_groups": None, "responders": tuple(DEFAULT_RESPONDERS)},
     "C4": {"temporal_groups": (), "responders": tuple(DEFAULT_RESPONDERS)},
     "LGB468": {
-        "temporal_groups": (
-            "rmean5", "historical_zscore20", "minus_ema20",
-            "rolling_std20", "lag1", "diff1",
-        ),
+        "temporal_columns": COMPACT_468_TEMPORAL_COLUMNS,
         "responders": (),
     },
     "LGB468_C4": {
-        "temporal_groups": (
-            "rmean5", "historical_zscore20", "minus_ema20",
-            "rolling_std20", "lag1", "diff1",
-        ),
+        "temporal_columns": COMPACT_468_TEMPORAL_COLUMNS,
         "responders": tuple(DEFAULT_RESPONDERS),
+        "selection_candidate": True,
+    },
+    "LGB1356": {
+        "temporal_groups": None,
+        "responders": (),
+    },
+    "LGB1356_C4": {
+        "temporal_groups": None,
+        "responders": tuple(DEFAULT_RESPONDERS),
+        "selection_candidate": True,
     },
     "C2": {
         "temporal_groups": (),
@@ -1128,7 +1160,10 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
     elif args.experiment_suite == "legacy":
         names = ["A", "B", "C", "D"]
     elif args.experiment_suite == "next-step":
-        names = ["A", "C4", "LGB468", "LGB468_C4"]
+        names = [
+            "A", "C4", "LGB468", "LGB468_C4",
+            "LGB1356", "LGB1356_C4",
+        ]
     elif args.experiment_suite == "responder":
         names = [
             "A", "R02", "R03", "R28", "R29",
@@ -1147,7 +1182,8 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
             "A", "B", "C", "D",
             "R02", "R03", "R28", "R29",
             "C2", "C2_R28", "C2_R29", "C4",
-            "LGB468", "LGB468_C4", "T60", "T20_60", "TZ",
+            "LGB468", "LGB468_C4", "LGB1356", "LGB1356_C4",
+            "T60", "T20_60", "TZ",
         ]
     unknown = [
         name for name in names
@@ -1175,8 +1211,24 @@ def target_experiment_spec(metadata: dict, name: str,
     base_names = [
         *metadata["feature_columns"], *temporal_columns, "asset_id"
     ]
-    temporal_groups = definition["temporal_groups"]
-    if temporal_groups is None:
+    explicit_temporal_columns = definition.get("temporal_columns")
+    temporal_groups = definition.get("temporal_groups")
+    if explicit_temporal_columns is not None:
+        requested_columns = set(explicit_temporal_columns)
+        missing_columns = [
+            column for column in explicit_temporal_columns
+            if column not in temporal_columns
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"experiment {name} needs temporal columns absent from cache: "
+                f"{missing_columns[:10]}"
+            )
+        temporal_offsets = [
+            index for index, column in enumerate(temporal_columns)
+            if column in requested_columns
+        ]
+    elif temporal_groups is None:
         temporal_offsets = list(range(len(temporal_columns)))
     else:
         temporal_offsets = [
@@ -1210,7 +1262,9 @@ def target_experiment_spec(metadata: dict, name: str,
     return {
         "name": name,
         "temporal_groups": (
-            ["all"] if temporal_groups is None else list(temporal_groups)
+            ["compact_468"]
+            if explicit_temporal_columns is not None
+            else ["all"] if temporal_groups is None else list(temporal_groups)
         ),
         "base_indices": base_indices,
         "responders": responder_names,
@@ -1220,7 +1274,32 @@ def target_experiment_spec(metadata: dict, name: str,
             definition.get("shuffle_within_time", False)
         ),
         "deployable": bool(definition.get("deployable", True)),
+        "selection_candidate": bool(
+            definition.get("selection_candidate", False)
+        ),
     }
+
+
+def registered_selection_candidates(
+    variants: list[str], experiment_specs: dict[str, dict],
+    allow_control_deployment: bool = False,
+) -> list[str]:
+    candidates = [
+        name for name in variants
+        if experiment_specs[name]["deployable"]
+        and experiment_specs[name]["selection_candidate"]
+    ]
+    if candidates:
+        return candidates
+    if allow_control_deployment:
+        return [
+            name for name in variants if experiment_specs[name]["deployable"]
+        ]
+    raise ValueError(
+        "the requested suite contains only control models; include "
+        "LGB468_C4 or a registered improvement, or explicitly pass "
+        "--allow-control-deployment for an isolated diagnostic run"
+    )
 
 
 def shuffled_within_time(values, time_ids, seed):
@@ -1330,6 +1409,7 @@ def main():
         "seed": args.seed,
         "target_param_candidates": target_profiles,
         "feature_health_rows": args.feature_health_rows,
+        "allow_control_deployment": args.allow_control_deployment,
     }
     model_metadata_matches = bool(
         existing_model_metadata
@@ -1863,11 +1943,17 @@ def main():
         target_cv_results[cache_key] = result
         return result
 
-    tuning_variant = (
-        "LGB468" if "LGB468" in variants
-        else "A" if "A" in variants
-        else next(name for name in variants if experiment_specs[name]["deployable"])
+    tuning_variant = next(
+        (
+            name for name in ("LGB1356_C4", "LGB468_C4", "LGB468", "A")
+            if name in variants
+        ),
+        None,
     )
+    if tuning_variant is None:
+        tuning_variant = next(
+            name for name in variants if experiment_specs[name]["deployable"]
+        )
     parameter_search = []
     for index, profile in enumerate(target_profiles, start=1):
         result = evaluate_target_cv(tuning_variant, profile)
@@ -1893,13 +1979,27 @@ def main():
         "C4": ["A"],
         "LGB468": ["A"],
         "LGB468_C4": ["LGB468", "C4"],
+        "LGB1356": ["LGB468"],
+        "LGB1356_C4": ["LGB1356", "LGB468_C4"],
     }
     cv_results = {
         variant: evaluate_target_cv(variant, selected_target_profile)
         for variant in variants
     }
+    registered_candidates = [
+        name for name in variants
+        if experiment_specs[name]["selection_candidate"]
+    ]
+    selection_candidates = registered_selection_candidates(
+        variants, experiment_specs, args.allow_control_deployment
+    )
+    if not registered_candidates:
+        progress(
+            "warning: control deployment explicitly enabled for this "
+            "diagnostic run"
+        )
     cv_ranked = sorted(
-        (name for name in variants if experiment_specs[name]["deployable"]),
+        selection_candidates,
         key=lambda name: -cv_results[name]["mean_fold_score"],
     )
     cv_winner = cv_ranked[0]
@@ -2068,7 +2168,7 @@ def main():
             ]
 
     deployable_ranked = sorted(
-        (name for name in holdout_variants if experiment_specs[name]["deployable"]),
+        (name for name in holdout_variants if name in selection_candidates),
         key=lambda name: -ablation_scores[name]["mean_fold_score"],
     )
     passing = [

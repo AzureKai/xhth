@@ -13,7 +13,11 @@ import numpy as np
 STRATEGY_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(STRATEGY_DIR))
 
-from temporal_features import TemporalFeatureBuilder, temporal_column_names
+from temporal_features import (
+    TEMPORAL_SUFFIXES,
+    TemporalFeatureBuilder,
+    temporal_column_names,
+)
 
 try:
     import lightgbm  # noqa: F401
@@ -30,6 +34,7 @@ from train import (
     clipping_diagnostics,
     matrix_for_segments,
     low_risk_lgb_params,
+    registered_selection_candidates,
     select_temporal_plan,
     session_patch,
     target_experiment_spec,
@@ -115,6 +120,101 @@ class Baseline468FeatureTests(unittest.TestCase):
         # the complete session rather than only the first 20 time steps.
         self.assertEqual(temporal_session_warmup(recipes), -1)
 
+    def test_all_feature_plan_routes_every_raw_feature_and_nests_compact_control(self):
+        payload = json.loads(
+            (STRATEGY_DIR / "all_feature_long_horizon_plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        history_features = payload["history_features"]
+        recipes = payload["recipes"]
+        required = {
+            "historical_zscore20", "minus_ema20", "rolling_std20"
+        }
+        self.assertEqual(len(history_features), 323)
+        self.assertEqual(len(set(history_features)), 323)
+        self.assertTrue(all(required.issubset(value) for value in recipes.values()))
+        self.assertEqual(sum(map(len, recipes.values())), 1032)
+        self.assertEqual(payload["source_model_feature_count"], 1356)
+
+        temporal_columns = temporal_column_names(history_features, recipes)
+        metadata = {
+            "feature_columns": [f"feature_{index:03d}" for index in range(323)],
+            "temporal_feature_columns": temporal_columns,
+        }
+        compact = target_experiment_spec(
+            metadata, "LGB468_C4", list(DEFAULT_RESPONDERS)
+        )
+        expanded_control = target_experiment_spec(
+            metadata, "LGB1356", list(DEFAULT_RESPONDERS)
+        )
+        expanded = target_experiment_spec(
+            metadata, "LGB1356_C4", list(DEFAULT_RESPONDERS)
+        )
+        baseline = target_experiment_spec(
+            metadata, "A", list(DEFAULT_RESPONDERS)
+        )
+        self.assertEqual(len(compact["feature_names"]), 472)
+        self.assertEqual(len(expanded_control["feature_names"]), 1356)
+        self.assertEqual(len(expanded["feature_names"]), 1360)
+        self.assertTrue(compact["selection_candidate"])
+        self.assertTrue(expanded["selection_candidate"])
+        self.assertFalse(expanded_control["selection_candidate"])
+        self.assertFalse(baseline["selection_candidate"])
+
+    def test_default_all_feature_plan_resolves_to_declared_width(self):
+        features = [f"feature_{index:03d}" for index in range(323)]
+        selected, recipes = select_temporal_plan(
+            features,
+            48,
+            importance_path=None,
+            plan_path=STRATEGY_DIR / "all_feature_long_horizon_plan.json",
+        )
+        self.assertEqual(selected, features)
+        self.assertEqual(sum(map(len, recipes.values())), 1032)
+        self.assertEqual(323 + 1032 + 1, 1356)
+        self.assertEqual(temporal_session_warmup(recipes), -1)
+
+    def test_only_c4_lineage_models_are_formal_selection_candidates(self):
+        metadata = {
+            "feature_columns": [f"feature_{index:03d}" for index in range(323)],
+            "temporal_feature_columns": temporal_column_names(
+                *self._all_feature_plan_parts()
+            ),
+        }
+        variants = [
+            "A", "C4", "LGB468", "LGB468_C4",
+            "LGB1356", "LGB1356_C4",
+        ]
+        specs = {
+            name: target_experiment_spec(
+                metadata, name, list(DEFAULT_RESPONDERS)
+            )
+            for name in variants
+        }
+        self.assertEqual(
+            registered_selection_candidates(variants, specs),
+            ["LGB468_C4", "LGB1356_C4"],
+        )
+        controls = ["A", "C4", "LGB468", "LGB1356"]
+        with self.assertRaisesRegex(ValueError, "only control models"):
+            registered_selection_candidates(controls, specs)
+        self.assertEqual(
+            registered_selection_candidates(
+                controls, specs, allow_control_deployment=True
+            ),
+            controls,
+        )
+
+    @staticmethod
+    def _all_feature_plan_parts():
+        payload = json.loads(
+            (STRATEGY_DIR / "all_feature_long_horizon_plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        return payload["history_features"], payload["recipes"]
+
     def test_history_transforms_match_baseline_cold_start_and_rolling_mean(self):
         recipes = {"feature_000": ["lag1", "diff1", "rmean5"]}
         builder = TemporalFeatureBuilder(
@@ -158,6 +258,29 @@ class Baseline468FeatureTests(unittest.TestCase):
             dtype=np.float32,
         )
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+
+    def test_recipe_routing_matches_full_temporal_matrix(self):
+        feature_names = ["feature_000", "feature_001"]
+        recipes = {
+            "feature_000": ["historical_zscore20", "lag1"],
+            "feature_001": ["rmean5", "xs_rank"],
+        }
+        asset_ids = np.asarray([1, 2, 1, 2], dtype=np.int64)
+        values = np.asarray(
+            [[1.0, 10.0], [4.0, 8.0], [3.0, 12.0], [7.0, 6.0]],
+            dtype=np.float32,
+        )
+        routed = TemporalFeatureBuilder(
+            2, feature_names=feature_names, recipes=recipes
+        ).transform(asset_ids, values)
+        full = TemporalFeatureBuilder(2).transform(asset_ids, values)
+        indices = [
+            feature_index * len(TEMPORAL_SUFFIXES)
+            + TEMPORAL_SUFFIXES.index(transform)
+            for feature_index, feature in enumerate(feature_names)
+            for transform in recipes[feature]
+        ]
+        np.testing.assert_allclose(routed, full[:, indices], atol=1e-6)
 
     def test_history_is_independent_per_asset_and_cleans_missing_values(self):
         recipes = {"feature_000": ["lag1", "diff1", "rmean5"]}

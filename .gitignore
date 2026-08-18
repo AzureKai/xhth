@@ -45,6 +45,8 @@ model/
 # Responder-assisted LightGBM strategy runtime artifacts
 examples/responder_assisted_lgb_catboost_strategy/work/
 examples/responder_assisted_lgb_catboost_strategy/model/
+examples/responder_assisted_lgb_catboost_strategy/work*/
+examples/responder_assisted_lgb_catboost_strategy/model*/
 examples/responder_assisted_lgb_catboost_strategy/work_single_responder/
 examples/responder_assisted_lgb_catboost_strategy/model_single_responder/
 examples/responder_assisted_lgb_catboost_strategy/model_c4_mechanism/
