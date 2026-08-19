@@ -27,9 +27,11 @@ except ModuleNotFoundError:
     sys.modules["lightgbm"] = lightgbm_stub
 
 from train import (
+    DEFAULT_TEMPORAL_PLAN_PATH,
     DEFAULT_RESPONDERS,
     ShardSequence,
     TARGET_PARAM_PROFILES,
+    TIER_RESPONDERS,
     build_cold_start_prefix,
     clipping_diagnostics,
     matrix_for_segments,
@@ -43,20 +45,39 @@ from train import (
 
 
 class Baseline468FeatureTests(unittest.TestCase):
-    def test_pre_registered_target_profiles_keep_smoothed_control(self):
+    def test_fixed_smoothed_profile_has_stronger_regularization(self):
         self.assertEqual(
             list(TARGET_PARAM_PROFILES),
-            ["smoothed", "reference", "guarded"],
+            ["smoothed"],
         )
         args = types.SimpleNamespace(seed=2026, threads=8)
         params = low_risk_lgb_params(args, seed=2027, profile="smoothed")
-        self.assertEqual(params["num_leaves"], 63)
-        self.assertEqual(params["max_depth"], 12)
-        self.assertEqual(params["path_smooth"], 100.0)
+        self.assertEqual(params["num_leaves"], 47)
+        self.assertEqual(params["max_depth"], 10)
+        self.assertEqual(params["min_data_in_leaf"], 5000)
+        self.assertEqual(params["feature_fraction"], 0.8)
+        self.assertEqual(params["feature_fraction_bynode"], 0.8)
+        self.assertEqual(params["lambda_l1"], 2.0)
+        self.assertEqual(params["lambda_l2"], 30.0)
+        self.assertEqual(params["path_smooth"], 150.0)
+        self.assertEqual(params["min_gain_to_split"], 0.01)
         self.assertEqual(params["data_random_seed"], 2026)
         self.assertEqual(params["bagging_seed"], 2027)
         self.assertEqual(params["histogram_pool_size"], 8192.0)
         self.assertNotIn("regularization_rank", params)
+
+    def test_compact_plan_and_responder_tier_are_production_defaults(self):
+        self.assertEqual(
+            DEFAULT_TEMPORAL_PLAN_PATH.name,
+            "long_horizon_468_feature_plan.json",
+        )
+        self.assertNotIn("responder_22", TIER_RESPONDERS)
+        self.assertNotIn("responder_23", TIER_RESPONDERS)
+        self.assertEqual(len(TIER_RESPONDERS), 10)
+        self.assertEqual(
+            DEFAULT_RESPONDERS,
+            ["responder_03", "responder_02"],
+        )
 
     def test_long_horizon_plan_has_exact_468_base_columns(self):
         payload = json.loads(
@@ -87,7 +108,7 @@ class Baseline468FeatureTests(unittest.TestCase):
         self.assertFalse(any("rolling_std60" in value for value in recipes.values()))
         self.assertEqual(len(temporal_column_names(history_features, recipes)), 144)
         self.assertEqual(323 + 144 + 1, payload["source_model_feature_count"])
-        self.assertEqual(323 + 144 + 1 + 4, 472)
+        self.assertEqual(323 + 144 + 1 + 2, 470)
 
         metadata = {
             "feature_columns": [f"feature_{index:03d}" for index in range(323)],
@@ -99,8 +120,10 @@ class Baseline468FeatureTests(unittest.TestCase):
             metadata, "LGB468_C4", list(DEFAULT_RESPONDERS)
         )
         self.assertEqual(len(spec["base_indices"]), 468)
-        self.assertEqual(len(spec["responder_indices"]), 4)
-        self.assertEqual(len(spec["feature_names"]), 472)
+        self.assertEqual(len(spec["responder_indices"]), 2)
+        self.assertNotIn("responder_28", spec["responders"])
+        self.assertNotIn("responder_29", spec["responders"])
+        self.assertEqual(len(spec["feature_names"]), 470)
 
     def test_exact_plan_loader_does_not_add_60_step_transforms(self):
         features = [f"feature_{index:03d}" for index in range(323)]
@@ -154,15 +177,15 @@ class Baseline468FeatureTests(unittest.TestCase):
         baseline = target_experiment_spec(
             metadata, "A", list(DEFAULT_RESPONDERS)
         )
-        self.assertEqual(len(compact["feature_names"]), 472)
+        self.assertEqual(len(compact["feature_names"]), 470)
         self.assertEqual(len(expanded_control["feature_names"]), 1356)
-        self.assertEqual(len(expanded["feature_names"]), 1360)
+        self.assertEqual(len(expanded["feature_names"]), 1358)
         self.assertTrue(compact["selection_candidate"])
         self.assertTrue(expanded["selection_candidate"])
         self.assertFalse(expanded_control["selection_candidate"])
         self.assertFalse(baseline["selection_candidate"])
 
-    def test_default_all_feature_plan_resolves_to_declared_width(self):
+    def test_experimental_all_feature_plan_resolves_to_declared_width(self):
         features = [f"feature_{index:03d}" for index in range(323)]
         selected, recipes = select_temporal_plan(
             features,

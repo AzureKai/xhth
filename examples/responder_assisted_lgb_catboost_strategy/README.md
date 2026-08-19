@@ -8,8 +8,8 @@
 - `main.py`：时序 API 推理入口。
 - `temporal_features.py`：严格历史时序特征状态机。
 - `baseline_468_feature_plan.json`：上一轮强 baseline 的原始 48×3 时序配方，保留作对照。
-- `long_horizon_468_feature_plan.json`：紧凑的 468 列长期时序对照配方。
-- `all_feature_long_horizon_plan.json`：当前默认的全 feature 长期时序配方。
+- `long_horizon_468_feature_plan.json`：当前默认的紧凑 468 列长期时序配方。
+- `all_feature_long_horizon_plan.json`：保留作专项消融的全 feature 长期时序配方。
 - `build_long_horizon_plan.py`：根据上一轮特征重要性重建长期配方。
 - `build_all_feature_long_horizon_plan.py`：把三种 20 步长变换扩展到全部原始 feature。
 - `screen_all_responders.py`：对原始数据中的全部 responder 做潜力筛选。
@@ -88,15 +88,15 @@ python3 examples/responder_assisted_lgb_catboost_strategy/analyze_feature_tempor
 - 按两个模型内归一化后的时序总 gain 选择 27 个源特征，每个生成 `historical_zscore20`、`minus_ema20`、`rolling_std20`，共 81 列。
 - 历史衍生列仍为 48 + 8 + 7 + 81 = 144，因此实验维度保持不变。
 - 1 个 categorical `asset_id`。
-- 合计 468 个 LightGBM 基础输入；再加入四个 OOF `responder_hat` 后，target 输入为 472 列。
+- 合计 468 个 LightGBM 基础输入；再加入 `responder_03/02` 的两个 OOF `responder_hat` 后，target 输入为 470 列。
 
-正式训练默认读取 `all_feature_long_horizon_plan.json`。全部 323 个原始 feature 都生成 `historical_zscore20`、`minus_ema20`、`rolling_std20`，同时保留上述紧凑计划中的 48 个 `rmean5`、8 个重要 `lag1` 和 7 个重要 `diff1`：
+正式训练默认读取紧凑的 `long_horizon_468_feature_plan.json`。全量 `all_feature_long_horizon_plan.json` 仅用于专项消融；它为全部 323 个原始 feature 生成 `historical_zscore20`、`minus_ema20`、`rolling_std20`，同时保留紧凑计划中的 48 个 `rmean5`、8 个重要 `lag1` 和 7 个重要 `diff1`：
 
 - 全 feature 长期列：323 × 3 = 969。
 - 紧凑计划额外短期列：48 + 8 + 7 = 63。
 - 时序衍生列：969 + 63 = 1032。
 - 完整基础矩阵：323 + 1032 + categorical `asset_id` = 1356。
-- 加入四个 `responder_hat` 后为 1360 列。
+- 加入两个 `responder_hat` 后为 1358 列。
 
 两个配方都设置 `exact_recipes=true`，加载器不会自动追加 60 步长变换。需要重新冻结两个配方时依次运行：
 
@@ -112,13 +112,13 @@ python3 examples/responder_assisted_lgb_catboost_strategy/build_all_feature_long
 
 ### 5. 训练模型
 
-内存非常充足时可以一次性装载当前训练和验证区间：
+默认 468 列计划在内存充足时推荐一次性装载，以减少 `Sequence` 和磁盘分片开销：
 
 ```powershell
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --threads 8
 ```
 
-全 feature 计划的基础矩阵有 1356 列，推荐先使用磁盘分片外存训练：
+内存不足或显式试验 1356 列全 feature 计划时使用磁盘分片外存训练：
 
 ```powershell
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode out-of-core --threads 8
@@ -131,14 +131,15 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 - 将 `asset_id` 作为 categorical feature，而不是普通连续数值。
 - 保留最后 15% 时间作为 terminal holdout；前 85% 内部使用 expanding-window OOF，并在每个边界加入 30 个观测时点的 purge。
 - 每个 OOF 验证折和 terminal holdout 都从空时序状态启动，严格模拟测试 API 冷启动。`historical_zscore20` 和 `rolling_std20` 只依赖前 20 期，但 `minus_ema20` 是递归状态；为保证完全无泄漏，当前长期计划会重建整个验证会话的时序列，而不是只修补前 20 个 `time_id`。
-- 优先在 `LGB1356_C4` 上比较 `smoothed/reference/guarded` 三个预注册 LightGBM 参数组，再用胜出参数对所有 target 变体做 walk-forward 比较；参数和变体均按多折平均分选择，而不是按 terminal holdout 排名。
+- target 固定使用强化正则后的 `smoothed`：47 个叶子、深度 10、每叶至少 5000 行、0.8 行列采样、L1=2、L2=30、`path_smooth=150`。不再在每次训练中重复比较 `reference/guarded`。
+- 正式 responder 固定为 `responder_03/02`；`responder_28/29` 已从默认 OOF、训练套件和机制消融中移除，`responder_22/23` 也不进入候选梯队。
 - target 晋级同时要求 OOF、holdout 和预测尺度合理；复杂变体还必须在平均折、至少 80% 可评估折、最新折和 holdout 上击败更简单的父模型。默认套件在 CV 冻结后只让 CV 冠军及其必要父模型进入 terminal holdout；专项诊断套件才会评估全部变体。
 - 预测裁剪边界只用 OOF 预测拟合，并且只有 OOF 与 holdout 都不变差时才在部署中启用。报告同时保存原始、裁剪和最终部署分数。
 - 选型结束后把 OOF 区间与 terminal holdout 标签合并，以 2026/2027/2028 三个种子重训 target；推理取三模型均值。
 - 用于验证的 responder 模型保存在 `work/selection_responder_models/`，与最终使用全部数据重训的部署 responder 模型严格分离。
 - 缓存绑定输入 Parquet 的路径、大小和修改时间；输入变化会自动重建。缓存同时对最早 500,000 行生成 `feature_health.json`，审计低有限值比例和常数特征，但默认不自动删列。
 
-可通过 `--purge-steps`、`--target-seeds`、`--valid-time-fraction`、`--oof-folds`、`--target-param-candidates` 和 `--feature-health-rows` 覆盖这些默认值。至少需要 3 个 responder OOF 折，默认 5 折会提供 4 个可用于 target 选型的时间折。新参数组依赖 LightGBM 4.6.x。
+可通过 `--purge-steps`、`--target-seeds`、`--valid-time-fraction`、`--oof-folds` 和 `--feature-health-rows` 覆盖这些默认值。`--target-param-candidates` 当前只接受 `smoothed`。至少需要 3 个 responder OOF 折，默认 5 折会提供 4 个可用于 target 选型的时间折。当前参数依赖 LightGBM 4.6.x。
 
 断点恢复并跳过兼容的已有模型：
 
@@ -157,19 +158,19 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 默认 `--experiment-suite next-step` 训练：
 
 - `A`：原始特征。
-- `C4`：原始特征加四个 responder_hat。
+- `C4`：原始特征加 `responder_03/02` 的两个 responder_hat；名称为兼容既有产物而保留。
 - `LGB468`：紧凑长期计划的 468 列特征，不加入 responder_hat。
-- `LGB468_C4`：紧凑 468 列加四个 OOF responder_hat，共 472 列。
-- `LGB1356`：全部 323 个 feature 使用三种长期变换的 1356 列模型，不加入 responder_hat。
-- `LGB1356_C4`：1356 列加四个 OOF responder_hat，共 1360 列。
+- `LGB468_C4`：紧凑 468 列加两个 OOF responder_hat，共 470 列；名称为兼容既有选型链路而保留。
 
-`A/C4/LGB468/LGB1356` 只作为父级对照，不具有正式部署资格。最终模型只能从 `LGB468_C4` 和注册为其改进方案的 `LGB1356_C4` 中选择。变体首先按 development walk-forward 平均分排序，然后经过 terminal holdout 晋级门槛；holdout 不直接用于挑选最高分。仅包含对照模型的专项实验默认拒绝覆盖最终模型，必须在独立目录中显式传入 `--allow-control-deployment`。
+`A/C4/LGB468` 只作为父级对照，不具有正式部署资格，默认最终模型只能选择 `LGB468_C4`。变体首先按 development walk-forward 平均分排序，然后经过 terminal holdout 晋级门槛；holdout 不直接用于挑选最高分。仅包含对照模型的专项实验默认拒绝覆盖最终模型，必须在独立目录中显式传入 `--allow-control-deployment`。
 
-重建时序缓存并运行完整嵌套对照：
+从上一版 1356 列缓存切回紧凑计划时执行一次：
 
 ```powershell
-python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode out-of-core --temporal-plan examples/responder_assisted_lgb_catboost_strategy/all_feature_long_horizon_plan.json --experiment-suite next-step --rebuild-cache --threads 8
+python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --temporal-plan examples/responder_assisted_lgb_catboost_strategy/long_horizon_468_feature_plan.json --experiment-suite next-step --target-param-candidates smoothed --rebuild-cache --threads 8
 ```
+
+第一次完成后，后续相同配置使用 `--skip-existing-models`，不要再传 `--rebuild-cache`。
 
 原始 A/B/C/D 套件：
 
@@ -177,7 +178,7 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model_legacy --experiment-suite legacy --allow-control-deployment --threads 8
 ```
 
-当前四个 responder 的专项消融：
+当前两个 responder 的专项消融：
 
 ```powershell
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model_responder_diagnostic --experiment-suite responder --allow-control-deployment --threads 8
@@ -189,15 +190,15 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model_c4_mechanism --training-data-mode in-memory --experiment-suite c4-mechanism --allow-control-deployment --skip-existing-models --threads 8
 ```
 
-该套件统一运行 A、C4、四个单 responder、四个 leave-one-out 和 `C4_SHUFFLED`。打乱对照在每个 `time_id` 内分别重排 `responder_hat`，保留当期分布但破坏样本对应关系；它只用于诊断，永远不会被选为部署模型。结果写入 `ablation_report.json`，并额外生成 `c4_mechanism_report.json`，其中正的 leave-one-out 数值表示删除该 responder 后 C4 变差。建议复用已有 `work/`，避免重新生成相同的 C4 OOF responder。
+该套件统一运行 A、C4、两个单 responder、两个 leave-one-out 和 `C4_SHUFFLED`。打乱对照在每个 `time_id` 内分别重排 `responder_hat`，保留当期分布但破坏样本对应关系；它只用于诊断，永远不会被选为部署模型。结果写入 `ablation_report.json`，并额外生成 `c4_mechanism_report.json`，其中正的 leave-one-out 数值表示删除该 responder 后 C4 变差。建议复用已有 `work/`，避免重新生成相同的 C4 OOF responder。
 
-对全量筛选结果中的一二梯队12个 responder 运行完整 OOF 单 responder 实验：
+对筛选梯队中移除 `responder_22/23` 后剩余的10个 responder 运行完整 OOF 单 responder 实验：
 
 ```powershell
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work_single_responder --model-dir examples/responder_assisted_lgb_catboost_strategy/model_single_responder --training-data-mode in-memory --experiment-suite single-responder --allow-control-deployment --threads 8
 ```
 
-该套件默认使用 `responder_14,09,08,10,22,23,21,42,07,15,41,24`，训练 A 基线以及每个候选单独加入一个 OOF `responder_hat` 的12个 target 模型。建议使用独立的 `work_single_responder/` 和 `model_single_responder/`，避免覆盖当前正式 C4。
+该套件默认使用 `responder_14,09,08,10,21,42,07,15,41,24`，训练 A 基线以及每个候选单独加入一个 OOF `responder_hat` 的10个 target 模型。`responder_22/23` 不再进入后续训练。建议使用独立的 `work_single_responder/` 和 `model_single_responder/`，避免覆盖当前正式 C4。
 
 也可以显式指定 responder 列表：
 

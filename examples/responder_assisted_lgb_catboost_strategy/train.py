@@ -18,43 +18,30 @@ from temporal_features import TemporalFeatureBuilder, temporal_column_names
 
 
 DEFAULT_RESPONDERS = [
-    "responder_03", "responder_28", "responder_29", "responder_02"
+    "responder_03", "responder_02"
 ]
 TIER_RESPONDERS = [
     "responder_14", "responder_09", "responder_08", "responder_10",
-    "responder_22", "responder_23", "responder_21", "responder_42",
-    "responder_07", "responder_15", "responder_41", "responder_24",
+    "responder_21", "responder_42", "responder_07", "responder_15",
+    "responder_41", "responder_24",
 ]
 TEMPORAL_ENGINE_VERSION = 4
 CACHE_SCHEMA_VERSION = 7
-LGB_PROFILE_VERSION = "walk_forward_v2"
+LGB_PROFILE_VERSION = "walk_forward_v3_regularized_smoothed"
 DEFAULT_TEMPORAL_PLAN_PATH = (
-    Path(__file__).resolve().parent / "all_feature_long_horizon_plan.json"
+    Path(__file__).resolve().parent / "long_horizon_468_feature_plan.json"
 )
 COMPACT_TEMPORAL_PLAN_PATH = (
     Path(__file__).resolve().parent / "long_horizon_468_feature_plan.json"
 )
 TARGET_PARAM_PROFILES = {
     "smoothed": {
-        "num_leaves": 63, "max_depth": 12, "min_data_in_leaf": 3500,
-        "feature_fraction": 0.9, "feature_fraction_bynode": 0.9,
-        "bagging_fraction": 0.85, "lambda_l1": 1.0,
-        "lambda_l2": 15.0, "path_smooth": 100.0,
-        "regularization_rank": 2,
-    },
-    "reference": {
-        "num_leaves": 63, "max_depth": -1, "min_data_in_leaf": 2000,
-        "feature_fraction": 0.8, "feature_fraction_bynode": 1.0,
-        "bagging_fraction": 0.8, "lambda_l1": 0.0,
-        "lambda_l2": 10.0, "path_smooth": 0.0,
-        "regularization_rank": 0,
-    },
-    "guarded": {
-        "num_leaves": 95, "max_depth": 14, "min_data_in_leaf": 5000,
-        "feature_fraction": 0.9, "feature_fraction_bynode": 0.9,
-        "bagging_fraction": 0.8, "lambda_l1": 1.0,
-        "lambda_l2": 20.0, "path_smooth": 100.0,
-        "regularization_rank": 2,
+        "num_leaves": 47, "max_depth": 10, "min_data_in_leaf": 5000,
+        "feature_fraction": 0.8, "feature_fraction_bynode": 0.8,
+        "bagging_fraction": 0.8, "lambda_l1": 2.0,
+        "lambda_l2": 30.0, "path_smooth": 150.0,
+        "min_gain_to_split": 0.01,
+        "regularization_rank": 3,
     },
 }
 
@@ -95,8 +82,8 @@ def parse_args():
         "--temporal-plan",
         default="",
         help=(
-            "Optional temporal plan override. By default the all-feature "
-            "all_feature_long_horizon_plan.json is used."
+            "Optional temporal plan override. By default the compact "
+            "long_horizon_468_feature_plan.json is used."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=65_536)
@@ -114,8 +101,8 @@ def parse_args():
     parser.add_argument("--target-rounds", type=int, default=1200)
     parser.add_argument(
         "--target-param-candidates",
-        default="smoothed,reference,guarded",
-        help="Comma-separated pre-registered target LightGBM profiles.",
+        default="smoothed",
+        help="Fixed target LightGBM profile; only smoothed is registered.",
     )
     parser.add_argument(
         "--responders",
@@ -140,7 +127,7 @@ def parse_args():
         default="next-step",
         help=(
             "legacy runs A/B/C/D; next-step runs the compact target suite; "
-            "responder isolates the default four; c4-mechanism adds leave-one-"
+            "responder isolates the default two; c4-mechanism adds leave-one-"
             "out and within-time shuffled controls; single-responder runs one "
             "full OOF target experiment per screened candidate."
         ),
@@ -954,8 +941,7 @@ def segmented_validation_scores(time_ids, y, pred, weight, parts: int = 4):
 
 def c4_mechanism_summary(scores):
     required = {
-        "A", "C4", "R02", "R03", "R28", "R29",
-        "C4_NO_R02", "C4_NO_R03", "C4_NO_R28", "C4_NO_R29",
+        "A", "C4", "R02", "R03", "C4_NO_R02", "C4_NO_R03",
         "C4_SHUFFLED",
     }
     if not required.issubset(scores):
@@ -975,11 +961,11 @@ def c4_mechanism_summary(scores):
     c4 = scores["C4"]
     baseline = scores["A"]
     shuffled = scores["C4_SHUFFLED"]
-    member_suffixes = ("R02", "R03", "R28", "R29")
+    member_suffixes = ("R02", "R03")
     return {
         "interpretation": {
             "c4_vs_baseline": (
-                "Total value of the four responder_hat features."
+                "Total value of the two responder_hat features."
             ),
             "c4_vs_shuffled": (
                 "Sample-level information beyond within-time distributions."
@@ -1041,43 +1027,19 @@ TARGET_EXPERIMENTS = {
         "temporal_groups": (),
         "responders": ("responder_03",),
     },
-    "R28": {
-        "temporal_groups": (),
-        "responders": ("responder_28",),
-    },
-    "R29": {
-        "temporal_groups": (),
-        "responders": ("responder_29",),
-    },
     "C4_NO_R02": {
         "temporal_groups": (),
-        "responders": ("responder_03", "responder_28", "responder_29"),
+        "responders": ("responder_03",),
     },
     "C4_NO_R03": {
         "temporal_groups": (),
-        "responders": ("responder_28", "responder_29", "responder_02"),
-    },
-    "C4_NO_R28": {
-        "temporal_groups": (),
-        "responders": ("responder_03", "responder_29", "responder_02"),
-    },
-    "C4_NO_R29": {
-        "temporal_groups": (),
-        "responders": ("responder_03", "responder_28", "responder_02"),
+        "responders": ("responder_02",),
     },
     "C4_SHUFFLED": {
         "temporal_groups": (),
         "responders": tuple(DEFAULT_RESPONDERS),
         "shuffle_within_time": True,
         "deployable": False,
-    },
-    "C2_R28": {
-        "temporal_groups": (),
-        "responders": ("responder_03", "responder_02", "responder_28"),
-    },
-    "C2_R29": {
-        "temporal_groups": (),
-        "responders": ("responder_03", "responder_02", "responder_29"),
     },
     "T60": {
         "temporal_groups": ("rolling_std60", "minus_ema60"),
@@ -1160,19 +1122,13 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
     elif args.experiment_suite == "legacy":
         names = ["A", "B", "C", "D"]
     elif args.experiment_suite == "next-step":
-        names = [
-            "A", "C4", "LGB468", "LGB468_C4",
-            "LGB1356", "LGB1356_C4",
-        ]
+        names = ["A", "C4", "LGB468", "LGB468_C4"]
     elif args.experiment_suite == "responder":
-        names = [
-            "A", "R02", "R03", "R28", "R29",
-            "C2", "C2_R28", "C2_R29", "C4",
-        ]
+        names = ["A", "R02", "R03", "C4"]
     elif args.experiment_suite == "c4-mechanism":
         names = [
-            "A", "C4", "R02", "R03", "R28", "R29",
-            "C4_NO_R02", "C4_NO_R03", "C4_NO_R28", "C4_NO_R29",
+            "A", "C4", "R02", "R03",
+            "C4_NO_R02", "C4_NO_R03",
             "C4_SHUFFLED",
         ]
     elif args.experiment_suite == "single-responder":
@@ -1180,8 +1136,7 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
     else:
         names = [
             "A", "B", "C", "D",
-            "R02", "R03", "R28", "R29",
-            "C2", "C2_R28", "C2_R29", "C4",
+            "R02", "R03", "C2", "C4",
             "LGB468", "LGB468_C4", "LGB1356", "LGB1356_C4",
             "T60", "T20_60", "TZ",
         ]
@@ -1778,6 +1733,10 @@ def main():
         "oof_signature": oof_signature,
         "variants": variants,
         "profiles": target_profiles,
+        "profile_parameters": {
+            name: TARGET_PARAM_PROFILES[name] for name in target_profiles
+        },
+        "lgb_profile_version": LGB_PROFILE_VERSION,
         "target_rounds": args.target_rounds,
         "early_stopping": args.early_stopping,
         "history": "cold_start_per_fold",
