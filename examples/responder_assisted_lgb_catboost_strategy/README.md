@@ -4,9 +4,9 @@
 
 ## 当前模型
 
-正式模型为 `LGB468_C4`。名称中的 `C4` 为兼容现有产物而保留，当前实际只使用两个 responder。
+正式模型从 `LGB468_C4` 及其跨折稳定删列版本 `LGB468_C4_STABLE` 中选择。名称中的 `C4` 为兼容现有产物而保留，当前实际只使用两个 responder。
 
-模型输入共 470 列：
+完整候选输入共 470 列：
 
 - 323 个原始 feature。
 - 144 个严格历史时序特征。
@@ -21,6 +21,8 @@
 - 27 个源 feature 分别生成 `historical_zscore20`、`minus_ema20` 和 `rolling_std20`，共 81 列。
 
 `asset_id` 作为 LightGBM categorical feature，时序特征只能使用当前 `time_id` 之前的数据。
+
+训练会读取 `LGB468_C4` 的每个 development CV 折模型，统计特征在各折是否被使用以及归一化 gain 的稳定性。默认保留至少 75% 折出现的特征，最多保留 420 列；不足 320 列时按稳定分数回填。`asset_id` 和两个 responder_hat 始终保留。删列候选必须在 walk-forward 和未参与筛选的 terminal holdout 上通过相对完整模型的晋级门槛，才允许部署。
 
 ## 主要文件
 
@@ -46,19 +48,21 @@ python3 -m pip install -r examples/responder_assisted_lgb_catboost_strategy/requ
 
 ## 训练
 
-内存充足时推荐一次性读取数据。第一次训练或配置变化后运行：
+内存充足时推荐一次性读取数据。首次从空目录训练时运行：
 
 ```powershell
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --temporal-plan examples/responder_assisted_lgb_catboost_strategy/long_horizon_468_feature_plan.json --experiment-suite next-step --target-param-candidates smoothed --rebuild-cache --threads 8
 ```
 
-后续使用相同配置恢复训练并跳过兼容的已有模型：
+后续恢复训练，或在已有 468 列、`responder_03/02` 产物上增加稳定筛选时运行：
 
 ```powershell
 python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root data --work-dir examples/responder_assisted_lgb_catboost_strategy/work --model-dir examples/responder_assisted_lgb_catboost_strategy/model --training-data-mode in-memory --temporal-plan examples/responder_assisted_lgb_catboost_strategy/long_horizon_468_feature_plan.json --experiment-suite next-step --target-param-candidates smoothed --skip-existing-models --threads 8
 ```
 
 内存不足时，将 `--training-data-mode in-memory` 改为 `--training-data-mode out-of-core`。两种模式使用相同的数据切分、特征和标签。
+
+稳定筛选只新增 target 候选；使用 `--skip-existing-models` 时会复用兼容的缓存、responder OOF、部署 responder 和四个基础 target 折模型。不要为这一实验单独传入 `--rebuild-cache`。
 
 ### 固定训练配置
 
@@ -71,19 +75,21 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 - 最后 15% 时间作为 terminal holdout。
 - development 区间使用 5 折 expanding-window OOF，切分边界 purge 30 个时间步。
 - target 使用种子 2026、2027、2028 重训，推理取三个模型均值。
+- 稳定筛选默认 `min_fold_rate=0.75`、`min_count=320`、`max_count=420`。
 
 缓存会绑定数据文件指纹、特征配方、responder 列表和 LightGBM 配置版本。配置不兼容时会自动重建，`--skip-existing-models` 不会复用旧模型。
 
 ### 当前对照模型
 
-默认 `next-step` 套件训练四个模型：
+默认 `next-step` 套件训练五个模型：
 
 - `A`：323 个原始 feature 和 categorical `asset_id`。
 - `C4`：A 加两个 OOF responder 预测。
 - `LGB468`：468 列基础输入，不使用 responder 预测。
 - `LGB468_C4`：468 列基础输入加两个 OOF responder 预测，共 470 列。
+- `LGB468_C4_STABLE`：从 `LGB468_C4` 各折重要性中筛出的 320～420 列稳定子集。
 
-前三个模型仅作对照；正式部署候选固定为 `LGB468_C4`。选型先比较 development walk-forward 分数，再检查 terminal holdout、预测尺度、裁剪和晋级门槛。holdout 不直接用于挑选最高分模型。
+前三个模型仅作对照；正式部署候选为 `LGB468_C4` 和 `LGB468_C4_STABLE`。选型先比较 development walk-forward 分数，再检查 terminal holdout、预测尺度、裁剪和晋级门槛。稳定删列版本若未通过相对完整模型的全部门槛，不会作为保守回退模型。holdout 不直接用于挑选最高分模型。
 
 ### 训练产物
 
@@ -92,6 +98,8 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 - `model/target_lightgbm.txt`：首个种子模型的兼容别名。
 - `model/responder_*.txt`：最终 responder 模型。
 - `model/target_feature_importance.csv`：target 特征重要性。
+- `model/stable_feature_report.csv`：逐特征跨折出现率、归一化 gain、稳定分数和保留原因。
+- `model/stable_feature_selection.json`：稳定筛选参数及最终特征清单。
 - `model/ablation_report.json`：对照模型和选型结果。
 - `work/cache/`：预处理后的缓存分片。
 - `work/selection_responder_models/`：仅用于验证的 responder 模型。

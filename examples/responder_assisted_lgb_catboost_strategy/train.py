@@ -105,6 +105,21 @@ def parse_args():
         help="Fixed target LightGBM profile; only smoothed is registered.",
     )
     parser.add_argument(
+        "--stable-feature-min-fold-rate", type=float, default=0.75,
+        help=(
+            "Minimum fraction of target CV folds with non-zero importance "
+            "for a feature to enter the stable pool."
+        ),
+    )
+    parser.add_argument(
+        "--stable-feature-min-count", type=int, default=320,
+        help="Backfill the stable target candidate to at least this many columns.",
+    )
+    parser.add_argument(
+        "--stable-feature-max-count", type=int, default=420,
+        help="Maximum columns retained by the stable target candidate.",
+    )
+    parser.add_argument(
         "--responders",
         default="",
         help=(
@@ -1006,6 +1021,12 @@ TARGET_EXPERIMENTS = {
         "responders": tuple(DEFAULT_RESPONDERS),
         "selection_candidate": True,
     },
+    "LGB468_C4_STABLE": {
+        "temporal_columns": COMPACT_468_TEMPORAL_COLUMNS,
+        "responders": tuple(DEFAULT_RESPONDERS),
+        "selection_candidate": True,
+        "stable_source": "LGB468_C4",
+    },
     "LGB1356": {
         "temporal_groups": None,
         "responders": (),
@@ -1122,7 +1143,10 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
     elif args.experiment_suite == "legacy":
         names = ["A", "B", "C", "D"]
     elif args.experiment_suite == "next-step":
-        names = ["A", "C4", "LGB468", "LGB468_C4"]
+        names = [
+            "A", "C4", "LGB468", "LGB468_C4",
+            "LGB468_C4_STABLE",
+        ]
     elif args.experiment_suite == "responder":
         names = ["A", "R02", "R03", "C4"]
     elif args.experiment_suite == "c4-mechanism":
@@ -1137,9 +1161,12 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
         names = [
             "A", "B", "C", "D",
             "R02", "R03", "C2", "C4",
-            "LGB468", "LGB468_C4", "LGB1356", "LGB1356_C4",
+            "LGB468", "LGB468_C4", "LGB468_C4_STABLE",
+            "LGB1356", "LGB1356_C4",
             "T60", "T20_60", "TZ",
         ]
+    if "LGB468_C4_STABLE" in names and "LGB468_C4" not in names:
+        names.insert(names.index("LGB468_C4_STABLE"), "LGB468_C4")
     unknown = [
         name for name in names
         if name not in TARGET_EXPERIMENTS and not name.startswith("S_responder_")
@@ -1232,6 +1259,172 @@ def target_experiment_spec(metadata: dict, name: str,
         "selection_candidate": bool(
             definition.get("selection_candidate", False)
         ),
+        "stable_source": definition.get("stable_source"),
+    }
+
+
+def cross_fold_feature_stability(
+    feature_names: list[str], fold_gain, fold_split,
+    min_fold_rate: float, min_count: int, max_count: int,
+    protected_features: TypingSequence[str] = (),
+) -> tuple[pd.DataFrame, list[str], dict]:
+    """Rank features by repeated use and normalized gain across CV folds."""
+    names = list(feature_names)
+    if len(names) != len(set(names)):
+        raise ValueError("stable feature selection requires unique feature names")
+    gain = np.nan_to_num(
+        np.asarray(fold_gain, dtype=np.float64),
+        nan=0.0, posinf=0.0, neginf=0.0,
+    )
+    split = np.nan_to_num(
+        np.asarray(fold_split, dtype=np.float64),
+        nan=0.0, posinf=0.0, neginf=0.0,
+    )
+    expected_shape = (gain.shape[0], len(names)) if gain.ndim == 2 else None
+    if gain.ndim != 2 or split.shape != gain.shape or gain.shape != expected_shape:
+        raise ValueError(
+            "fold importance arrays must have shape (folds, features)"
+        )
+    if gain.shape[0] < 2:
+        raise ValueError("stable feature selection requires at least two folds")
+    if not 0.0 < min_fold_rate <= 1.0:
+        raise ValueError("stable feature min fold rate must be in (0, 1]")
+    if min_count < 1 or max_count < min_count:
+        raise ValueError("stable feature counts must satisfy 1 <= min <= max")
+    min_count = min(int(min_count), len(names))
+    max_count = min(int(max_count), len(names))
+    protected = list(dict.fromkeys(protected_features))
+    unknown_protected = [name for name in protected if name not in names]
+    if unknown_protected:
+        raise ValueError(
+            f"protected stable features are absent: {unknown_protected}"
+        )
+    if len(protected) > max_count:
+        raise ValueError("stable feature max count is below protected feature count")
+
+    gain = np.maximum(gain, 0.0)
+    split = np.maximum(split, 0.0)
+    used = (gain > 0.0) | (split > 0.0)
+    gain_total = gain.sum(axis=1, keepdims=True)
+    split_total = split.sum(axis=1, keepdims=True)
+    normalized_gain = np.divide(
+        gain, gain_total, out=np.zeros_like(gain), where=gain_total > 0.0
+    )
+    normalized_split = np.divide(
+        split, split_total, out=np.zeros_like(split), where=split_total > 0.0
+    )
+    used_folds = used.sum(axis=0)
+    used_fold_rate = used.mean(axis=0)
+    mean_gain = normalized_gain.mean(axis=0)
+    std_gain = normalized_gain.std(axis=0)
+    gain_cv = np.divide(
+        std_gain, mean_gain,
+        out=np.full_like(std_gain, np.inf), where=mean_gain > 0.0,
+    )
+    stability_score = np.divide(
+        mean_gain * used_fold_rate,
+        1.0 + np.where(np.isfinite(gain_cv), gain_cv, 0.0),
+    )
+    frame = pd.DataFrame({
+        "feature": names,
+        "used_folds": used_folds.astype(np.int64),
+        "fold_count": gain.shape[0],
+        "used_fold_rate": used_fold_rate,
+        "mean_normalized_gain": mean_gain,
+        "std_normalized_gain": std_gain,
+        "gain_cv": gain_cv,
+        "mean_normalized_split": normalized_split.mean(axis=0),
+        "stability_score": stability_score,
+    })
+    frame["stable_eligible"] = frame["used_fold_rate"] >= min_fold_rate
+    frame["protected"] = frame["feature"].isin(protected)
+    ranked = frame.sort_values(
+        [
+            "stable_eligible", "stability_score", "mean_normalized_gain",
+            "used_fold_rate", "feature",
+        ],
+        ascending=[False, False, False, False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    ranked["selection_rank"] = np.arange(1, len(ranked) + 1)
+
+    selected = set(protected)
+    for row in ranked.itertuples(index=False):
+        if len(selected) >= max_count:
+            break
+        if row.stable_eligible:
+            selected.add(row.feature)
+    if len(selected) < min_count:
+        for feature in ranked["feature"]:
+            selected.add(feature)
+            if len(selected) >= min_count:
+                break
+
+    ranked["selected"] = ranked["feature"].isin(selected)
+    ranked["selection_reason"] = np.where(
+        ranked["protected"], "protected",
+        np.where(
+            ranked["selected"] & ranked["stable_eligible"], "stable",
+            np.where(ranked["selected"], "backfill", "excluded"),
+        ),
+    )
+    selected_in_model_order = [name for name in names if name in selected]
+    summary = {
+        "fold_count": int(gain.shape[0]),
+        "source_feature_count": len(names),
+        "selected_feature_count": len(selected_in_model_order),
+        "excluded_feature_count": len(names) - len(selected_in_model_order),
+        "stable_eligible_count": int(frame["stable_eligible"].sum()),
+        "min_fold_rate": float(min_fold_rate),
+        "min_count": int(min_count),
+        "max_count": int(max_count),
+        "protected_features": protected,
+        "selected_features": selected_in_model_order,
+    }
+    return ranked, selected_in_model_order, summary
+
+
+def subset_target_experiment_spec(
+    spec: dict, selected_features: TypingSequence[str], name: str,
+) -> dict:
+    """Apply a stable feature allow-list while preserving matrix order."""
+    selected = list(dict.fromkeys(selected_features))
+    available = list(spec["feature_names"])
+    unknown = [feature for feature in selected if feature not in available]
+    if unknown:
+        raise ValueError(f"stable feature subset contains unknown columns: {unknown}")
+    required = ["asset_id", *(f"{value}_hat" for value in spec["responders"])]
+    missing_required = [feature for feature in required if feature not in selected]
+    if missing_required:
+        raise ValueError(
+            f"stable feature subset removed required columns: {missing_required}"
+        )
+    selected_set = set(selected)
+    base_count = len(spec["base_indices"])
+    base_names = available[:base_count]
+    kept_base = [
+        (index, feature)
+        for index, feature in zip(spec["base_indices"], base_names)
+        if feature in selected_set
+    ]
+    kept_responders = [
+        (responder, index)
+        for responder, index in zip(
+            spec["responders"], spec["responder_indices"]
+        )
+        if f"{responder}_hat" in selected_set
+    ]
+    return {
+        **spec,
+        "name": name,
+        "base_indices": [index for index, _ in kept_base],
+        "responders": [responder for responder, _ in kept_responders],
+        "responder_indices": [index for _, index in kept_responders],
+        "feature_names": [
+            *(feature for _, feature in kept_base),
+            *(f"{responder}_hat" for responder, _ in kept_responders),
+        ],
+        "stable_selection_applied": True,
     }
 
 
@@ -1319,6 +1512,15 @@ def main():
         raise ValueError("--oof-folds must be at least 3 for target walk-forward")
     if args.feature_health_rows < 0:
         raise ValueError("--feature-health-rows must be non-negative")
+    if not 0.0 < args.stable_feature_min_fold_rate <= 1.0:
+        raise ValueError("--stable-feature-min-fold-rate must be in (0, 1]")
+    if (
+        args.stable_feature_min_count < 1
+        or args.stable_feature_max_count < args.stable_feature_min_count
+    ):
+        raise ValueError(
+            "stable feature counts must satisfy 1 <= min-count <= max-count"
+        )
     responders = configured_responders(args)
     target_seeds = configured_target_seeds(args)
     target_profiles = configured_target_profiles(args)
@@ -1338,6 +1540,11 @@ def main():
         model_dir / "validation_predictions.npz",
         model_dir / "feature_health_report.json",
     ])
+    if "LGB468_C4_STABLE" in requested_target_experiments:
+        final_files.extend([
+            model_dir / "stable_feature_report.csv",
+            model_dir / "stable_feature_selection.json",
+        ])
     existing_model_metadata = None
     if (model_dir / "metadata.json").exists():
         existing_model_metadata = json.loads(
@@ -1363,10 +1570,13 @@ def main():
         "early_stopping": args.early_stopping,
         "seed": args.seed,
         "target_param_candidates": target_profiles,
+        "stable_feature_min_fold_rate": args.stable_feature_min_fold_rate,
+        "stable_feature_min_count": args.stable_feature_min_count,
+        "stable_feature_max_count": args.stable_feature_max_count,
         "feature_health_rows": args.feature_health_rows,
         "allow_control_deployment": args.allow_control_deployment,
     }
-    model_metadata_matches = bool(
+    responder_model_metadata_matches = bool(
         existing_model_metadata
         and existing_model_metadata.get("temporal_recipes")
         and int(existing_model_metadata.get("temporal_engine_version", 0))
@@ -1375,12 +1585,28 @@ def main():
         and existing_model_metadata.get("responders") == responders
         and existing_model_metadata.get("lgb_profile_version")
         == LGB_PROFILE_VERSION
-        and existing_model_metadata.get("target_seeds") == target_seeds
+        and existing_model_metadata.get("input_files") == requested_input_files
         and int(existing_model_metadata.get("purge_steps", -1))
         == args.purge_steps
+        and int(existing_model_metadata.get("oof_folds", -1))
+        == args.oof_folds
+        and existing_model_metadata.get("training_config", {}).get(
+            "warmup_fraction"
+        ) == args.warmup_fraction
+        and existing_model_metadata.get("training_config", {}).get(
+            "responder_rounds"
+        ) == args.responder_rounds
+        and existing_model_metadata.get("training_config", {}).get(
+            "early_stopping"
+        ) == args.early_stopping
+        and existing_model_metadata.get("training_config", {}).get("seed")
+        == args.seed
+    )
+    model_metadata_matches = bool(
+        responder_model_metadata_matches
+        and existing_model_metadata.get("target_seeds") == target_seeds
         and existing_model_metadata.get("training_config")
         == requested_training_config
-        and existing_model_metadata.get("input_files") == requested_input_files
     )
     target_suite_matches = bool(
         existing_model_metadata
@@ -1729,9 +1955,13 @@ def main():
         f"profiles={target_profiles}"
     )
     importance_frames = []
+    base_cv_variants = [
+        name for name in variants
+        if not experiment_specs[name].get("stable_source")
+    ]
     target_cv_signature_payload = {
         "oof_signature": oof_signature,
-        "variants": variants,
+        "variants": base_cv_variants,
         "profiles": target_profiles,
         "profile_parameters": {
             name: TARGET_PARAM_PROFILES[name] for name in target_profiles
@@ -1768,6 +1998,19 @@ def main():
         raise ValueError("target walk-forward requires at least three responder OOF folds")
 
     target_cv_results = {}
+    stable_target_cv_dir = None
+
+    def target_cv_model_path(variant, profile, fold):
+        spec = experiment_specs[variant]
+        directory = (
+            stable_target_cv_dir
+            if spec.get("stable_selection_applied") else target_cv_dir
+        )
+        if directory is None:
+            raise ValueError(
+                f"stable feature selection has not been prepared for {variant}"
+            )
+        return directory / f"{profile}_{variant}_fold{fold:02d}.txt"
 
     def evaluate_target_cv(variant, profile):
         cache_key = (variant, profile)
@@ -1820,7 +2063,7 @@ def main():
             fold_w_valid = vector_for_segments(
                 cache_dir, fold_valid_segments, "weight"
             )
-            model_path = target_cv_dir / f"{profile}_{variant}_fold{fold:02d}.txt"
+            model_path = target_cv_model_path(variant, profile, fold)
             if args.skip_existing_models and model_path.exists():
                 model = lgb.Booster(model_file=str(model_path))
                 if model.num_feature() != len(spec["feature_names"]):
@@ -1934,10 +2177,121 @@ def main():
         f"tuning_variant={tuning_variant}"
     )
 
+    stable_feature_selection = None
+    stable_variants = [
+        name for name in variants
+        if experiment_specs[name].get("stable_source")
+    ]
+    if len(stable_variants) > 1:
+        raise ValueError("only one stable feature candidate is currently supported")
+    if stable_variants:
+        stable_variant = stable_variants[0]
+        source_variant = experiment_specs[stable_variant]["stable_source"]
+        if source_variant not in variants:
+            raise ValueError(
+                f"stable feature source {source_variant} is not being trained"
+            )
+        evaluate_target_cv(source_variant, selected_target_profile)
+        source_spec = experiment_specs[source_variant]
+        fold_gain = []
+        fold_split = []
+        for record in target_cv_records:
+            fold = int(record["fold"])
+            model_path = target_cv_model_path(
+                source_variant, selected_target_profile, fold
+            )
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"stable feature source model is missing: {model_path}"
+                )
+            fold_model = lgb.Booster(model_file=str(model_path))
+            if fold_model.num_feature() != len(source_spec["feature_names"]):
+                raise ValueError(
+                    f"stable source fold {fold} has {fold_model.num_feature()} "
+                    f"features; expected {len(source_spec['feature_names'])}"
+                )
+            fold_gain.append(
+                fold_model.feature_importance(importance_type="gain")
+            )
+            fold_split.append(
+                fold_model.feature_importance(importance_type="split")
+            )
+        protected_features = [
+            "asset_id",
+            *(f"{name}_hat" for name in source_spec["responders"]),
+        ]
+        stability_frame, stable_features, stable_feature_selection = (
+            cross_fold_feature_stability(
+                source_spec["feature_names"], fold_gain, fold_split,
+                args.stable_feature_min_fold_rate,
+                args.stable_feature_min_count,
+                args.stable_feature_max_count,
+                protected_features,
+            )
+        )
+        stable_feature_selection.update({
+            "source_variant": source_variant,
+            "candidate_variant": stable_variant,
+            "profile": selected_target_profile,
+            "method": (
+                "nonzero_fold_rate_then_normalized_gain_stability_with_backfill"
+            ),
+            "development_adaptive": True,
+            "selection_note": (
+                "The subset is learned only from development CV fold models; "
+                "terminal holdout remains untouched until candidate selection."
+            ),
+        })
+        experiment_specs[stable_variant] = subset_target_experiment_spec(
+            source_spec, stable_features, stable_variant
+        )
+        stable_cv_signature_payload = {
+            "base_target_cv_signature": target_cv_signature,
+            "source_variant": source_variant,
+            "candidate_variant": stable_variant,
+            "profile": selected_target_profile,
+            "min_fold_rate": args.stable_feature_min_fold_rate,
+            "min_count": args.stable_feature_min_count,
+            "max_count": args.stable_feature_max_count,
+            "method_version": 1,
+            "selected_features": stable_features,
+        }
+        stable_cv_signature = hashlib.sha256(
+            json.dumps(
+                stable_cv_signature_payload, sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+        stable_target_cv_dir = (
+            target_cv_dir / f"stable_{stable_cv_signature[:16]}"
+        )
+        stable_target_cv_dir.mkdir(parents=True, exist_ok=True)
+        (stable_target_cv_dir / "config.json").write_text(
+            json.dumps(stable_cv_signature_payload, indent=2),
+            encoding="utf-8",
+        )
+        stable_feature_selection["target_cv_signature"] = stable_cv_signature
+        stability_frame.insert(0, "source_variant", source_variant)
+        stability_frame.insert(1, "profile", selected_target_profile)
+        stability_frame.to_csv(
+            model_dir / "stable_feature_report.csv", index=False
+        )
+        (model_dir / "stable_feature_selection.json").write_text(
+            json.dumps(stable_feature_selection, indent=2), encoding="utf-8"
+        )
+        progress(
+            f"stable feature selection: source={source_variant}, "
+            f"selected={len(stable_features)}/{len(source_spec['feature_names'])}, "
+            f"eligible={stable_feature_selection['stable_eligible_count']}"
+        )
+    else:
+        (model_dir / "stable_feature_report.csv").unlink(missing_ok=True)
+        (model_dir / "stable_feature_selection.json").unlink(missing_ok=True)
+
     comparators = {
         "C4": ["A"],
         "LGB468": ["A"],
         "LGB468_C4": ["LGB468", "C4"],
+        "LGB468_C4_STABLE": ["LGB468_C4"],
         "LGB1356": ["LGB468"],
         "LGB1356_C4": ["LGB1356", "LGB468_C4"],
     }
@@ -2134,11 +2488,21 @@ def main():
         name for name in deployable_ranked
         if ablation_scores[name]["promotion_gates"]["passed"]
     ]
-    best_variant = passing[0] if passing else deployable_ranked[0]
+    conservative_fallbacks = [
+        name for name in deployable_ranked
+        if not experiment_specs[name].get("stable_source")
+    ]
+    best_variant = (
+        passing[0]
+        if passing else (
+            conservative_fallbacks[0]
+            if conservative_fallbacks else deployable_ranked[0]
+        )
+    )
     if not passing:
         progress(
             "warning: no target variant passed every promotion gate; "
-            f"falling back to CV winner {best_variant}"
+            f"falling back conservatively to {best_variant}"
         )
     best_spec = experiment_specs[best_variant]
     best_result = ablation_scores[best_variant]
@@ -2240,7 +2604,7 @@ def main():
         final_rounds = int(np.median(responder_best_iterations[name]))
         can_load = bool(
             args.skip_existing_models
-            and model_metadata_matches
+            and responder_model_metadata_matches
             and model_path.exists()
         )
         if can_load:
@@ -2281,6 +2645,7 @@ def main():
              "target_experiment_specs": experiment_specs,
              "target_parameter_search": parameter_search,
              "selected_target_profile": selected_target_profile,
+             "stable_feature_selection": stable_feature_selection,
              "responder_diagnostics": responder_diagnostics,
              "c4_mechanism": mechanism_summary},
             indent=2,
@@ -2331,6 +2696,10 @@ def main():
         "ablation_scores": ablation_scores,
         "responder_diagnostics": responder_diagnostics,
         "target_feature_importance": "target_feature_importance.csv",
+        "stable_feature_report": (
+            "stable_feature_report.csv" if stable_feature_selection else None
+        ),
+        "stable_feature_selection": stable_feature_selection,
         "ablation_report": "ablation_report.json",
         "valid_cutoff_time_id": valid_cutoff, "oof_folds": args.oof_folds,
         "purge_steps": args.purge_steps,

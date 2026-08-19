@@ -34,11 +34,14 @@ from train import (
     TIER_RESPONDERS,
     build_cold_start_prefix,
     clipping_diagnostics,
+    cross_fold_feature_stability,
     matrix_for_segments,
     low_risk_lgb_params,
     registered_selection_candidates,
     select_temporal_plan,
+    selected_experiments,
     session_patch,
+    subset_target_experiment_spec,
     target_experiment_spec,
     temporal_session_warmup,
 )
@@ -66,6 +69,69 @@ class Baseline468FeatureTests(unittest.TestCase):
         self.assertEqual(params["histogram_pool_size"], 8192.0)
         self.assertNotIn("regularization_rank", params)
 
+    def test_cross_fold_stability_keeps_repeated_and_protected_features(self):
+        names = [
+            "feature_000", "ts_lag1_feature_000", "feature_noise",
+            "asset_id", "responder_03_hat", "responder_02_hat",
+        ]
+        gain = np.asarray([
+            [10, 4, 5, 1, 0, 0],
+            [12, 3, 0, 1, 0, 0],
+            [11, 2, 0, 1, 0, 0],
+            [9, 0, 0, 1, 0, 0],
+        ], dtype=np.float64)
+        split = (gain > 0).astype(np.float64)
+        report, selected, summary = cross_fold_feature_stability(
+            names, gain, split, min_fold_rate=0.75,
+            min_count=5, max_count=5,
+            protected_features=[
+                "asset_id", "responder_03_hat", "responder_02_hat",
+            ],
+        )
+        self.assertEqual(len(selected), 5)
+        self.assertIn("feature_000", selected)
+        self.assertIn("ts_lag1_feature_000", selected)
+        self.assertNotIn("feature_noise", selected)
+        self.assertEqual(summary["stable_eligible_count"], 3)
+        reasons = report.set_index("feature")["selection_reason"].to_dict()
+        self.assertEqual(reasons["responder_03_hat"], "protected")
+        self.assertEqual(reasons["feature_noise"], "excluded")
+
+    def test_stable_subset_preserves_matrix_order_and_required_columns(self):
+        spec = {
+            "name": "LGB468_C4",
+            "base_indices": [10, 11, 12],
+            "responders": ["responder_03", "responder_02"],
+            "responder_indices": [0, 1],
+            "feature_names": [
+                "feature_000", "feature_001", "asset_id",
+                "responder_03_hat", "responder_02_hat",
+            ],
+            "temporal_groups": ["compact_468"],
+            "shuffle_within_time": False,
+            "deployable": True,
+            "selection_candidate": True,
+            "stable_source": "LGB468_C4",
+        }
+        subset = subset_target_experiment_spec(
+            spec,
+            [
+                "feature_000", "asset_id",
+                "responder_03_hat", "responder_02_hat",
+            ],
+            "LGB468_C4_STABLE",
+        )
+        self.assertEqual(subset["base_indices"], [10, 12])
+        self.assertEqual(subset["responder_indices"], [0, 1])
+        self.assertEqual(
+            subset["feature_names"],
+            [
+                "feature_000", "asset_id",
+                "responder_03_hat", "responder_02_hat",
+            ],
+        )
+        self.assertTrue(subset["stable_selection_applied"])
+
     def test_compact_plan_and_responder_tier_are_production_defaults(self):
         self.assertEqual(
             DEFAULT_TEMPORAL_PLAN_PATH.name,
@@ -77,6 +143,19 @@ class Baseline468FeatureTests(unittest.TestCase):
         self.assertEqual(
             DEFAULT_RESPONDERS,
             ["responder_03", "responder_02"],
+        )
+
+    def test_default_suite_includes_stable_improvement_and_source(self):
+        args = types.SimpleNamespace(
+            ablation_mode="all", target_experiments="",
+            experiment_suite="next-step",
+        )
+        self.assertEqual(
+            selected_experiments(args, list(DEFAULT_RESPONDERS)),
+            [
+                "A", "C4", "LGB468", "LGB468_C4",
+                "LGB468_C4_STABLE",
+            ],
         )
 
     def test_long_horizon_plan_has_exact_468_base_columns(self):
@@ -207,7 +286,7 @@ class Baseline468FeatureTests(unittest.TestCase):
         }
         variants = [
             "A", "C4", "LGB468", "LGB468_C4",
-            "LGB1356", "LGB1356_C4",
+            "LGB468_C4_STABLE", "LGB1356", "LGB1356_C4",
         ]
         specs = {
             name: target_experiment_spec(
@@ -217,7 +296,7 @@ class Baseline468FeatureTests(unittest.TestCase):
         }
         self.assertEqual(
             registered_selection_candidates(variants, specs),
-            ["LGB468_C4", "LGB1356_C4"],
+            ["LGB468_C4", "LGB468_C4_STABLE", "LGB1356_C4"],
         )
         controls = ["A", "C4", "LGB468", "LGB1356"]
         with self.assertRaisesRegex(ValueError, "only control models"):
