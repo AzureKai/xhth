@@ -57,6 +57,9 @@ examples/responder_assisted_lgb_catboost_strategy/validate_model_artifacts.ps1
 examples/lgb_tcn_ensemble_strategy/work/
 examples/lgb_tcn_ensemble_strategy/model/
 examples/lgb_tcn_ensemble_strategy/submission.csv
+examples/lgb_v3_regime_residual_strategy/work/
+examples/lgb_v3_regime_residual_strategy/model/
+examples/lgb_v3_regime_residual_strategy/submission.csv
 
 # Logs and temporary files
 *.log
