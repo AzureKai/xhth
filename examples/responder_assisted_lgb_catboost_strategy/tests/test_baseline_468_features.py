@@ -18,6 +18,7 @@ from temporal_features import (
     TemporalFeatureBuilder,
     temporal_column_names,
 )
+from main import normalized_model_weights
 
 try:
     import lightgbm  # noqa: F401
@@ -30,6 +31,7 @@ from train import (
     DEFAULT_TEMPORAL_PLAN_PATH,
     DEFAULT_RESPONDERS,
     ShardSequence,
+    SlicedSequence,
     TARGET_PARAM_PROFILES,
     TIER_RESPONDERS,
     build_cold_start_prefix,
@@ -38,6 +40,7 @@ from train import (
     matrix_for_segments,
     low_risk_lgb_params,
     registered_selection_candidates,
+    select_oof_blend_weight,
     select_temporal_plan,
     selected_experiments,
     session_patch,
@@ -155,8 +158,78 @@ class Baseline468FeatureTests(unittest.TestCase):
             [
                 "A", "C4", "LGB468", "LGB468_C4",
                 "LGB468_C4_STABLE",
+                "LGB468_C4_STABLE_RECENT50",
+                "LGB468_C4_STABLE_BLEND",
             ],
         )
+
+    def test_recent_and_blend_specs_keep_oof_protocol_as_model_variants(self):
+        metadata = {
+            "feature_columns": [f"feature_{index:03d}" for index in range(323)],
+            "temporal_feature_columns": temporal_column_names(
+                *self._all_feature_plan_parts()
+            ),
+        }
+        recent = target_experiment_spec(
+            metadata, "LGB468_C4_STABLE_RECENT50", list(DEFAULT_RESPONDERS)
+        )
+        blend = target_experiment_spec(
+            metadata, "LGB468_C4_STABLE_BLEND", list(DEFAULT_RESPONDERS)
+        )
+        self.assertEqual(recent["train_window_fraction"], 0.5)
+        self.assertFalse(recent["virtual_blend"])
+        self.assertTrue(blend["virtual_blend"])
+        self.assertTrue(blend["selection_candidate"])
+        self.assertEqual(
+            blend["stable_feature_parent"], "LGB468_C4_STABLE"
+        )
+
+    def test_explicit_blend_adds_all_training_dependencies(self):
+        args = types.SimpleNamespace(
+            ablation_mode="all",
+            target_experiments="LGB468_C4_STABLE_BLEND",
+            experiment_suite="next-step",
+        )
+        self.assertEqual(
+            selected_experiments(args, list(DEFAULT_RESPONDERS)),
+            [
+                "LGB468_C4", "LGB468_C4_STABLE",
+                "LGB468_C4_STABLE_RECENT50",
+                "LGB468_C4_STABLE_BLEND",
+            ],
+        )
+
+    def test_oof_blend_selects_best_preregistered_recent_weight(self):
+        targets = [
+            np.asarray([1.0, 2.0]),
+            np.asarray([2.0, 4.0]),
+        ]
+        weights = [np.ones(2), np.ones(2)]
+        full = [np.zeros(2), np.zeros(2)]
+        recent = [targets[0].copy(), targets[1].copy()]
+        report, predictions = select_oof_blend_weight(
+            targets, weights, full, recent, [0.25, 0.5, 0.75]
+        )
+        self.assertEqual(report["recent_weight"], 0.75)
+        self.assertEqual(len(report["weight_search"]), 3)
+        np.testing.assert_allclose(predictions[0], targets[0] * 0.75)
+
+    def test_sliced_sequence_does_not_change_row_values(self):
+        source = np.arange(30, dtype=np.float64).reshape(10, 3)
+        sliced = SlicedSequence(source, 4)
+        self.assertEqual(len(sliced), 6)
+        np.testing.assert_array_equal(sliced[:], source[4:])
+        np.testing.assert_array_equal(sliced[-1], source[-1])
+
+    def test_inference_model_weights_are_explicit_and_normalized(self):
+        actual = normalized_model_weights([0.25, 0.25, 0.5], 3)
+        np.testing.assert_allclose(actual, [0.25, 0.25, 0.5])
+        np.testing.assert_allclose(
+            normalized_model_weights(None, 3),
+            np.full(3, 1.0 / 3.0),
+        )
+        with self.assertRaisesRegex(ValueError, "matching target_models"):
+            normalized_model_weights([1.0, -1.0], 2)
 
     def test_long_horizon_plan_has_exact_468_base_columns(self):
         payload = json.loads(

@@ -120,6 +120,14 @@ def parse_args():
         help="Maximum columns retained by the stable target candidate.",
     )
     parser.add_argument(
+        "--recent-window-fraction", type=float, default=0.5,
+        help="Fraction of each available target training history used by RECENT50.",
+    )
+    parser.add_argument(
+        "--blend-recent-weights", default="0.25,0.5,0.75",
+        help="Pre-registered recent-model weights evaluated on development OOF.",
+    )
+    parser.add_argument(
         "--responders",
         default="",
         help=(
@@ -750,6 +758,41 @@ class ConcatenatedSequence(lgb.Sequence):
         return self._rows(value, value + 1)[0]
 
 
+class SlicedSequence(lgb.Sequence):
+    """Expose a row slice without materializing a disk-backed Sequence."""
+
+    batch_size = 8192
+
+    def __init__(self, source, start: int, stop: int | None = None):
+        source_length = len(source)
+        self.source = source
+        self.start = max(0, int(start))
+        self.stop = source_length if stop is None else min(source_length, int(stop))
+        if self.start >= self.stop:
+            raise ValueError("cannot create an empty training slice")
+
+    def __len__(self):
+        return self.stop - self.start
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            data = self.source[self.start + start:self.start + stop]
+            return data if step == 1 else data[::step]
+        if isinstance(index, (list, np.ndarray)):
+            values = np.asarray(index, dtype=np.int64)
+            values = np.where(values < 0, values + len(self), values)
+            if np.any((values < 0) | (values >= len(self))):
+                raise IndexError(index)
+            return self.source[(values + self.start).tolist()]
+        value = int(index)
+        if value < 0:
+            value += len(self)
+        if value < 0 or value >= len(self):
+            raise IndexError(value)
+        return self.source[self.start + value]
+
+
 def matrix_for_segments(cache_dir: Path, segments, extra=None,
                         base_indices: np.ndarray | None = None,
                         patches=None) -> np.ndarray:
@@ -797,6 +840,13 @@ def concatenate_training_matrices(args, *sources):
         )
         return matrix
     return ConcatenatedSequence(*sources)
+
+
+def slice_training_matrix(args, source, start: int):
+    """Slice an in-memory matrix or a disk-backed Sequence consistently."""
+    if args.training_data_mode == "in-memory":
+        return source[start:]
+    return SlicedSequence(source, start)
 
 
 def vector_for_segments(cache_dir: Path, segments, suffix: str, column: int | None = None):
@@ -923,6 +973,65 @@ def clipping_diagnostics(y, pred, weight, bounds=None):
     }
 
 
+def select_oof_blend_weight(
+    fold_targets, fold_weights, full_predictions, recent_predictions,
+    recent_weights: TypingSequence[float],
+) -> tuple[dict, list[np.ndarray]]:
+    """Select a pre-registered FULL/RECENT weight using development folds."""
+    fold_count = len(fold_targets)
+    if not (
+        fold_count == len(fold_weights) == len(full_predictions)
+        == len(recent_predictions)
+    ) or fold_count < 2:
+        raise ValueError("blend inputs must contain the same number of folds")
+    candidates = []
+    candidate_predictions = {}
+    merged_y = np.concatenate(fold_targets)
+    merged_w = np.concatenate(fold_weights)
+    for recent_weight in recent_weights:
+        recent_weight = float(recent_weight)
+        if not 0.0 < recent_weight < 1.0:
+            raise ValueError("blend recent weights must be in (0, 1)")
+        predictions = [
+            np.asarray(full, dtype=np.float32) * (1.0 - recent_weight)
+            + np.asarray(recent, dtype=np.float32) * recent_weight
+            for full, recent in zip(full_predictions, recent_predictions)
+        ]
+        scores = [
+            weighted_r2(y, pred, weight)
+            for y, pred, weight in zip(
+                fold_targets, predictions, fold_weights
+            )
+        ]
+        merged_prediction = np.concatenate(predictions)
+        report = {
+            "recent_weight": recent_weight,
+            "full_weight": 1.0 - recent_weight,
+            "fold_scores": list(map(float, scores)),
+            "mean_fold_score": float(np.mean(scores)),
+            "std_fold_score": float(np.std(scores)),
+            "min_fold_score": float(np.min(scores)),
+            "latest_fold_score": float(scores[-1]),
+            "positive_folds": int(np.sum(np.asarray(scores) > 0.0)),
+            "oof_raw": weighted_r2(
+                merged_y, merged_prediction, merged_w
+            ),
+        }
+        candidates.append(report)
+        candidate_predictions[recent_weight] = predictions
+    candidates.sort(
+        key=lambda item: (
+            -item["mean_fold_score"], -item["oof_raw"],
+            item["recent_weight"],
+        )
+    )
+    selected = candidates[0]
+    return {
+        **selected,
+        "weight_search": candidates,
+    }, candidate_predictions[selected["recent_weight"]]
+
+
 def segmented_validation_scores(time_ids, y, pred, weight, parts: int = 4):
     """Score contiguous validation-time blocks and report temporal stability."""
     time_ids = np.asarray(time_ids)
@@ -1026,6 +1135,20 @@ TARGET_EXPERIMENTS = {
         "responders": tuple(DEFAULT_RESPONDERS),
         "selection_candidate": True,
         "stable_source": "LGB468_C4",
+    },
+    "LGB468_C4_STABLE_RECENT50": {
+        "temporal_columns": COMPACT_468_TEMPORAL_COLUMNS,
+        "responders": tuple(DEFAULT_RESPONDERS),
+        "stable_feature_parent": "LGB468_C4_STABLE",
+        "train_window_fraction": 0.5,
+        "deployable": False,
+    },
+    "LGB468_C4_STABLE_BLEND": {
+        "temporal_columns": COMPACT_468_TEMPORAL_COLUMNS,
+        "responders": tuple(DEFAULT_RESPONDERS),
+        "stable_feature_parent": "LGB468_C4_STABLE",
+        "virtual_blend": True,
+        "selection_candidate": True,
     },
     "LGB1356": {
         "temporal_groups": None,
@@ -1132,6 +1255,19 @@ def configured_target_profiles(args) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def configured_blend_recent_weights(args) -> list[float]:
+    values = [
+        float(value.strip())
+        for value in args.blend_recent_weights.split(",")
+        if value.strip()
+    ]
+    if not values:
+        raise ValueError("--blend-recent-weights must not be empty")
+    if any(not 0.0 < value < 1.0 for value in values):
+        raise ValueError("blend recent weights must be strictly between 0 and 1")
+    return list(dict.fromkeys(values))
+
+
 def selected_experiments(args, responders: list[str]) -> list[str]:
     if args.ablation_mode != "all":
         return [args.ablation_mode]
@@ -1145,7 +1281,8 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
     elif args.experiment_suite == "next-step":
         names = [
             "A", "C4", "LGB468", "LGB468_C4",
-            "LGB468_C4_STABLE",
+            "LGB468_C4_STABLE", "LGB468_C4_STABLE_RECENT50",
+            "LGB468_C4_STABLE_BLEND",
         ]
     elif args.experiment_suite == "responder":
         names = ["A", "R02", "R03", "C4"]
@@ -1162,11 +1299,27 @@ def selected_experiments(args, responders: list[str]) -> list[str]:
             "A", "B", "C", "D",
             "R02", "R03", "C2", "C4",
             "LGB468", "LGB468_C4", "LGB468_C4_STABLE",
+            "LGB468_C4_STABLE_RECENT50", "LGB468_C4_STABLE_BLEND",
             "LGB1356", "LGB1356_C4",
             "T60", "T20_60", "TZ",
         ]
+    if (
+        "LGB468_C4_STABLE_BLEND" in names
+        and "LGB468_C4_STABLE_RECENT50" not in names
+    ):
+        names.insert(
+            names.index("LGB468_C4_STABLE_BLEND"),
+            "LGB468_C4_STABLE_RECENT50",
+        )
     if "LGB468_C4_STABLE" in names and "LGB468_C4" not in names:
         names.insert(names.index("LGB468_C4_STABLE"), "LGB468_C4")
+    for dynamic_name in (
+        "LGB468_C4_STABLE_RECENT50", "LGB468_C4_STABLE_BLEND",
+    ):
+        if dynamic_name in names and "LGB468_C4_STABLE" not in names:
+            names.insert(names.index(dynamic_name), "LGB468_C4_STABLE")
+            if "LGB468_C4" not in names:
+                names.insert(names.index("LGB468_C4_STABLE"), "LGB468_C4")
     unknown = [
         name for name in names
         if name not in TARGET_EXPERIMENTS and not name.startswith("S_responder_")
@@ -1260,6 +1413,9 @@ def target_experiment_spec(metadata: dict, name: str,
             definition.get("selection_candidate", False)
         ),
         "stable_source": definition.get("stable_source"),
+        "stable_feature_parent": definition.get("stable_feature_parent"),
+        "train_window_fraction": definition.get("train_window_fraction", 1.0),
+        "virtual_blend": bool(definition.get("virtual_blend", False)),
     }
 
 
@@ -1521,9 +1677,12 @@ def main():
         raise ValueError(
             "stable feature counts must satisfy 1 <= min-count <= max-count"
         )
+    if not 0.0 < args.recent_window_fraction < 1.0:
+        raise ValueError("--recent-window-fraction must be in (0, 1)")
     responders = configured_responders(args)
     target_seeds = configured_target_seeds(args)
     target_profiles = configured_target_profiles(args)
+    blend_recent_weights = configured_blend_recent_weights(args)
     requested_target_experiments = selected_experiments(args, responders)
     data_root, work_dir, model_dir = Path(args.data_root), Path(args.work_dir), Path(args.model_dir)
     data_files = manifest_files(data_root)
@@ -1535,7 +1694,6 @@ def main():
     final_files = [model_dir / f"{name}.txt" for name in responders]
     final_files.extend([
         model_dir / "target_lightgbm.txt",
-        *(model_dir / f"target_final_seed{seed}.txt" for seed in target_seeds),
         model_dir / "metadata.json",
         model_dir / "validation_predictions.npz",
         model_dir / "feature_health_report.json",
@@ -1545,11 +1703,15 @@ def main():
             model_dir / "stable_feature_report.csv",
             model_dir / "stable_feature_selection.json",
         ])
+    if "LGB468_C4_STABLE_BLEND" in requested_target_experiments:
+        final_files.append(model_dir / "temporal_blend_report.json")
     existing_model_metadata = None
     if (model_dir / "metadata.json").exists():
         existing_model_metadata = json.loads(
             (model_dir / "metadata.json").read_text(encoding="utf-8")
         )
+        for filename in existing_model_metadata.get("target_models", []):
+            final_files.append(model_dir / filename)
     requested_plan_path = (
         Path(args.temporal_plan) if args.temporal_plan
         else DEFAULT_TEMPORAL_PLAN_PATH
@@ -1573,6 +1735,8 @@ def main():
         "stable_feature_min_fold_rate": args.stable_feature_min_fold_rate,
         "stable_feature_min_count": args.stable_feature_min_count,
         "stable_feature_max_count": args.stable_feature_max_count,
+        "recent_window_fraction": args.recent_window_fraction,
+        "blend_recent_weights": blend_recent_weights,
         "feature_health_rows": args.feature_health_rows,
         "allow_control_deployment": args.allow_control_deployment,
     }
@@ -1958,6 +2122,8 @@ def main():
     base_cv_variants = [
         name for name in variants
         if not experiment_specs[name].get("stable_source")
+        and not experiment_specs[name].get("stable_feature_parent")
+        and not experiment_specs[name].get("virtual_blend")
     ]
     target_cv_signature_payload = {
         "oof_signature": oof_signature,
@@ -1980,36 +2146,48 @@ def main():
         json.dumps(target_cv_signature_payload, indent=2), encoding="utf-8"
     )
 
-    def oof_patches_for_rows(row_count):
+    def oof_patches_for_slice(row_start, row_count):
         patches = []
+        row_end = row_start + row_count
         for record in oof_fold_records:
             prefix = record["cold_prefix"]
-            if prefix is None or record["oof_start"] >= row_count:
+            patch_start = int(record["oof_start"])
+            patch_end = patch_start + (0 if prefix is None else len(prefix))
+            intersection_start = max(row_start, patch_start)
+            intersection_end = min(row_end, patch_end)
+            if prefix is None or intersection_start >= intersection_end:
                 continue
-            available = min(len(prefix), row_count - record["oof_start"])
             patches.append((
-                record["oof_start"], record["oof_start"] + available,
-                prefix[:available],
+                intersection_start - row_start,
+                intersection_end - row_start,
+                prefix[
+                    intersection_start - patch_start:
+                    intersection_end - patch_start
+                ],
             ))
         return patches
+
+    def oof_patches_for_rows(row_count):
+        return oof_patches_for_slice(0, row_count)
 
     target_cv_records = oof_fold_records[1:]
     if len(target_cv_records) < 2:
         raise ValueError("target walk-forward requires at least three responder OOF folds")
 
     target_cv_results = {}
-    stable_target_cv_dir = None
+    target_cv_fold_predictions = {}
+    target_cv_variant_dirs = {}
+    blend_prediction_variants = (
+        {
+            "LGB468_C4_STABLE",
+            "LGB468_C4_STABLE_RECENT50",
+        }
+        if "LGB468_C4_STABLE_BLEND" in variants else set()
+    )
 
     def target_cv_model_path(variant, profile, fold):
         spec = experiment_specs[variant]
-        directory = (
-            stable_target_cv_dir
-            if spec.get("stable_selection_applied") else target_cv_dir
-        )
-        if directory is None:
-            raise ValueError(
-                f"stable feature selection has not been prepared for {variant}"
-            )
+        directory = target_cv_variant_dirs.get(variant, target_cv_dir)
         return directory / f"{profile}_{variant}_fold{fold:02d}.txt"
 
     def evaluate_target_cv(variant, profile):
@@ -2017,8 +2195,10 @@ def main():
         if cache_key in target_cv_results:
             return target_cv_results[cache_key]
         spec = experiment_specs[variant]
+        if spec.get("virtual_blend"):
+            raise ValueError(f"virtual blend {variant} must be evaluated separately")
         fold_reports = []
-        all_y, all_w, all_pred = [], [], []
+        all_y, all_w, all_pred, fold_predictions = [], [], [], []
         for record in target_cv_records:
             fold = int(record["fold"])
             fit_stop_index = max(
@@ -2026,14 +2206,30 @@ def main():
                 int(oof_boundaries[fold]) - args.purge_steps,
             )
             fit_end = int(train_times[fit_stop_index])
+            window_fraction = float(spec.get("train_window_fraction", 1.0))
+            fit_start_index = warmup_index
+            if window_fraction < 1.0:
+                available_steps = fit_stop_index - warmup_index
+                fit_start_index = fit_stop_index - max(
+                    1, int(np.ceil(available_steps * window_fraction))
+                )
+            fit_start = int(train_times[fit_start_index])
             fold_train_segments = segments_for_range(
-                cache_dir, metadata, int(train_times[warmup_index]), fit_end
+                cache_dir, metadata, fit_start, fit_end
+            )
+            prefix_segments = segments_for_range(
+                cache_dir, metadata, int(train_times[warmup_index]), fit_start
+            )
+            fold_train_offset = sum(
+                end - start for _, start, end in prefix_segments
             )
             fold_train_rows = sum(
                 end - start for _, start, end in fold_train_segments
             )
             fold_valid_segments = record["segments"]
-            fold_train_hat = oof_hat[:fold_train_rows]
+            fold_train_hat = oof_hat[
+                fold_train_offset:fold_train_offset + fold_train_rows
+            ]
             fold_valid_hat = oof_hat[record["oof_start"]:record["oof_end"]]
             needs_time = spec["shuffle_within_time"]
             fold_train_times = (
@@ -2048,7 +2244,9 @@ def main():
                 args, cache_dir, fold_train_segments, fold_valid_segments,
                 fold_train_hat, fold_valid_hat, spec,
                 fold_train_times, fold_valid_times,
-                train_patches=oof_patches_for_rows(fold_train_rows),
+                train_patches=oof_patches_for_slice(
+                    fold_train_offset, fold_train_rows
+                ),
                 valid_patches=session_patch(record["cold_prefix"]),
             )
             fold_y_train = vector_for_segments(
@@ -2103,6 +2301,8 @@ def main():
                 "time_start": record["time_start"],
                 "time_end": record["time_end"],
                 "train_rows": len(fold_train_x),
+                "train_time_start": fit_start,
+                "train_window_fraction": window_fraction,
                 "valid_rows": len(fold_valid_x),
                 "score": score,
                 "best_iteration": best_iteration,
@@ -2110,6 +2310,10 @@ def main():
             all_y.append(fold_y_valid)
             all_w.append(fold_w_valid)
             all_pred.append(prediction)
+            if variant in blend_prediction_variants:
+                fold_predictions.append(
+                    np.asarray(prediction, dtype=np.float32)
+                )
             progress(
                 f"target CV result: profile={profile}, variant={variant}, "
                 f"fold={fold}, R2={score:.8f}"
@@ -2143,6 +2347,8 @@ def main():
             ),
         }
         target_cv_results[cache_key] = result
+        if variant in blend_prediction_variants:
+            target_cv_fold_predictions[cache_key] = fold_predictions
         return result
 
     tuning_variant = next(
@@ -2270,6 +2476,7 @@ def main():
             encoding="utf-8",
         )
         stable_feature_selection["target_cv_signature"] = stable_cv_signature
+        target_cv_variant_dirs[stable_variant] = stable_target_cv_dir
         stability_frame.insert(0, "source_variant", source_variant)
         stability_frame.insert(1, "profile", selected_target_profile)
         stability_frame.to_csv(
@@ -2283,20 +2490,187 @@ def main():
             f"selected={len(stable_features)}/{len(source_spec['feature_names'])}, "
             f"eligible={stable_feature_selection['stable_eligible_count']}"
         )
+        for dynamic_name in variants:
+            dynamic_template = experiment_specs[dynamic_name]
+            parent_name = dynamic_template.get("stable_feature_parent")
+            if not parent_name:
+                continue
+            if parent_name != stable_variant:
+                raise ValueError(
+                    f"unsupported stable feature parent for {dynamic_name}: "
+                    f"{parent_name}"
+                )
+            experiment_specs[dynamic_name] = {
+                **experiment_specs[stable_variant],
+                "name": dynamic_name,
+                "selection_candidate": dynamic_template["selection_candidate"],
+                "deployable": dynamic_template["deployable"],
+                "stable_source": None,
+                "stable_feature_parent": parent_name,
+                "train_window_fraction": (
+                    args.recent_window_fraction
+                    if dynamic_name.endswith("RECENT50") else 1.0
+                ),
+                "virtual_blend": dynamic_template["virtual_blend"],
+            }
+            if not dynamic_template["virtual_blend"]:
+                recent_signature_payload = {
+                    "stable_target_cv_signature": stable_cv_signature,
+                    "variant": dynamic_name,
+                    "train_window_fraction": args.recent_window_fraction,
+                    "method_version": 1,
+                }
+                recent_signature = hashlib.sha256(
+                    json.dumps(
+                        recent_signature_payload, sort_keys=True
+                    ).encode("utf-8")
+                ).hexdigest()
+                recent_dir = (
+                    target_cv_dir / f"recent_{recent_signature[:16]}"
+                )
+                recent_dir.mkdir(parents=True, exist_ok=True)
+                (recent_dir / "config.json").write_text(
+                    json.dumps(recent_signature_payload, indent=2),
+                    encoding="utf-8",
+                )
+                target_cv_variant_dirs[dynamic_name] = recent_dir
     else:
         (model_dir / "stable_feature_report.csv").unlink(missing_ok=True)
         (model_dir / "stable_feature_selection.json").unlink(missing_ok=True)
+
+    temporal_blend_report = None
+    blend_variants = [
+        name for name in variants if experiment_specs[name].get("virtual_blend")
+    ]
+    if len(blend_variants) > 1:
+        raise ValueError("only one FULL/RECENT blend is currently supported")
+    if blend_variants:
+        blend_variant = blend_variants[0]
+        full_variant = "LGB468_C4_STABLE"
+        recent_variant = "LGB468_C4_STABLE_RECENT50"
+        if full_variant not in variants or recent_variant not in variants:
+            raise ValueError(
+                "FULL/RECENT blend requires stable full and recent controls"
+            )
+        full_result = evaluate_target_cv(
+            full_variant, selected_target_profile
+        )
+        recent_result = evaluate_target_cv(
+            recent_variant, selected_target_profile
+        )
+        fold_targets = [
+            vector_for_segments(cache_dir, record["segments"], "target")
+            for record in target_cv_records
+        ]
+        fold_weights = [
+            vector_for_segments(cache_dir, record["segments"], "weight")
+            for record in target_cv_records
+        ]
+        temporal_blend_report, blend_fold_predictions = (
+            select_oof_blend_weight(
+                fold_targets, fold_weights,
+                target_cv_fold_predictions[
+                    (full_variant, selected_target_profile)
+                ],
+                target_cv_fold_predictions[
+                    (recent_variant, selected_target_profile)
+                ],
+                blend_recent_weights,
+            )
+        )
+        blend_scores = temporal_blend_report["fold_scores"]
+        merged_y = np.concatenate(fold_targets)
+        merged_w = np.concatenate(fold_weights)
+        merged_prediction = np.concatenate(blend_fold_predictions)
+        blend_clip = clipping_diagnostics(
+            merged_y, merged_prediction, merged_w
+        )
+        blend_cv_result = {
+            "profile": selected_target_profile,
+            "folds": [
+                {
+                    **fold_report,
+                    "score": float(score),
+                    "component_best_iterations": {
+                        "full": full_result["folds"][index]["best_iteration"],
+                        "recent": recent_result["folds"][index]["best_iteration"],
+                    },
+                }
+                for index, (fold_report, score) in enumerate(
+                    zip(full_result["folds"], blend_scores)
+                )
+            ],
+            "mean_fold_score": temporal_blend_report["mean_fold_score"],
+            "std_fold_score": temporal_blend_report["std_fold_score"],
+            "min_fold_score": temporal_blend_report["min_fold_score"],
+            "latest_fold_score": temporal_blend_report["latest_fold_score"],
+            "positive_folds": temporal_blend_report["positive_folds"],
+            "mean_iterations": full_result["mean_iterations"],
+            "component_mean_iterations": {
+                "full": full_result["mean_iterations"],
+                "recent": recent_result["mean_iterations"],
+            },
+            "oof_raw": blend_clip["raw_score"],
+            "oof_clipped": blend_clip["clipped_score"],
+            "oof_clipping_delta": blend_clip["clipping_delta"],
+            "clip_min": blend_clip["clip_min"],
+            "clip_max": blend_clip["clip_max"],
+            "fitted_oof_scale": fitted_prediction_scale(
+                merged_y, merged_prediction, merged_w
+            ),
+            "blend_components": {
+                full_variant: temporal_blend_report["full_weight"],
+                recent_variant: temporal_blend_report["recent_weight"],
+            },
+            "blend_weight_search": temporal_blend_report["weight_search"],
+        }
+        target_cv_results[(blend_variant, selected_target_profile)] = (
+            blend_cv_result
+        )
+        target_cv_fold_predictions[
+            (blend_variant, selected_target_profile)
+        ] = blend_fold_predictions
+        experiment_specs[blend_variant]["blend_components"] = (
+            blend_cv_result["blend_components"]
+        )
+        temporal_blend_report.update({
+            "variant": blend_variant,
+            "full_variant": full_variant,
+            "recent_variant": recent_variant,
+            "recent_window_fraction": args.recent_window_fraction,
+            "development_adaptive": True,
+            "selection_note": (
+                "Weight is selected only from pre-registered development OOF "
+                "candidates; terminal holdout remains frozen."
+            ),
+        })
+        (model_dir / "temporal_blend_report.json").write_text(
+            json.dumps(temporal_blend_report, indent=2), encoding="utf-8"
+        )
+        progress(
+            f"temporal blend selected: recent_weight="
+            f"{temporal_blend_report['recent_weight']:.2f}, "
+            f"mean={temporal_blend_report['mean_fold_score']:.8f}"
+        )
+    else:
+        (model_dir / "temporal_blend_report.json").unlink(missing_ok=True)
 
     comparators = {
         "C4": ["A"],
         "LGB468": ["A"],
         "LGB468_C4": ["LGB468", "C4"],
-        "LGB468_C4_STABLE": ["LGB468_C4"],
+        "LGB468_C4_STABLE": ["LGB468_C4", "C4"],
+        "LGB468_C4_STABLE_RECENT50": ["LGB468_C4_STABLE"],
+        "LGB468_C4_STABLE_BLEND": ["LGB468_C4_STABLE", "C4"],
         "LGB1356": ["LGB468"],
         "LGB1356_C4": ["LGB1356", "LGB468_C4"],
     }
     cv_results = {
-        variant: evaluate_target_cv(variant, selected_target_profile)
+        variant: (
+            target_cv_results[(variant, selected_target_profile)]
+            if experiment_specs[variant].get("virtual_blend")
+            else evaluate_target_cv(variant, selected_target_profile)
+        )
         for variant in variants
     }
     registered_candidates = [
@@ -2323,14 +2697,20 @@ def main():
         }
     )
     holdout_variants = list(variants) if diagnostic_holdout else []
+    holdout_dependencies = {
+        "LGB468_C4_STABLE_BLEND": ["LGB468_C4_STABLE_RECENT50"],
+    }
 
     def add_with_parents(name):
         if name in holdout_variants:
             return
-        holdout_variants.append(name)
         for parent in comparators.get(name, []):
             if parent in variants:
                 add_with_parents(parent)
+        for dependency in holdout_dependencies.get(name, []):
+            if dependency in variants:
+                add_with_parents(dependency)
+        holdout_variants.append(name)
 
     if not diagnostic_holdout:
         add_with_parents(cv_winner)
@@ -2349,31 +2729,107 @@ def main():
         }
         for variant in variants
     }
+    target_train_stop_index = int(np.searchsorted(
+        train_times, target_train_upper, side="left"
+    ))
+
+    def target_holdout_training_view(spec):
+        window_fraction = float(spec.get("train_window_fraction", 1.0))
+        if window_fraction >= 1.0:
+            return (
+                target_train_segments, target_oof_hat, y_train, w_train,
+                target_train_times, oof_patches_for_rows(target_train_rows),
+            )
+        available_steps = target_train_stop_index - warmup_index
+        start_index = target_train_stop_index - max(
+            1, int(np.ceil(available_steps * window_fraction))
+        )
+        start_time = int(train_times[start_index])
+        segments = segments_for_range(
+            cache_dir, metadata, start_time, target_train_upper
+        )
+        prefix_segments = segments_for_range(
+            cache_dir, metadata, int(train_times[warmup_index]), start_time
+        )
+        offset = sum(end - start for _, start, end in prefix_segments)
+        rows = sum(end - start for _, start, end in segments)
+        times = (
+            vector_for_segments(cache_dir, segments, "time")
+            if spec["shuffle_within_time"] else None
+        )
+        return (
+            segments,
+            oof_hat[offset:offset + rows],
+            y_train[offset:offset + rows],
+            w_train[offset:offset + rows],
+            times,
+            oof_patches_for_slice(offset, rows),
+        )
+
+    holdout_predictions = {}
+    blend_holdout_components = {
+        component
+        for name in holdout_variants
+        if experiment_specs[name].get("virtual_blend")
+        for component in experiment_specs[name].get("blend_components", {})
+    }
     for index, variant in enumerate(holdout_variants, start=1):
         cv_result = cv_results[variant]
         spec = experiment_specs[variant]
-        target_train_x, target_valid_x = target_experiment_matrices(
-            args, cache_dir, target_train_segments, valid_segments,
-            target_oof_hat, valid_hat, spec, target_train_times, valid_times,
-            train_patches=oof_patches_for_rows(target_train_rows),
-            valid_patches=session_patch(holdout_cold_prefix),
-        )
-        variant_path = model_dir / f"target_{variant}.txt"
-        progress(
-            f"terminal holdout fit: variant={variant}, "
-            f"rounds={cv_result['mean_iterations']}"
-        )
-        target_model = train_lgb_fixed(
-            target_train_x, y_train, w_train,
-            cv_result["mean_iterations"], args,
-            f"target holdout {variant}",
-            categorical_feature=[spec["feature_names"].index("asset_id")],
-            profile=selected_target_profile,
-        )
-        target_model.save_model(str(variant_path))
-        prediction = predict_sequence(
-            target_model, target_valid_x, f"target holdout {variant}"
-        )
+        if spec.get("virtual_blend"):
+            component_predictions = []
+            component_files = {}
+            for component, weight in spec["blend_components"].items():
+                if component not in holdout_predictions:
+                    raise ValueError(
+                        f"blend component holdout prediction is missing: {component}"
+                    )
+                component_predictions.append(
+                    np.asarray(holdout_predictions[component]) * float(weight)
+                )
+                component_files[component] = ablation_scores[component].get("file")
+            prediction = np.sum(component_predictions, axis=0)
+            target_model = None
+            target_train_x = target_valid_x = None
+            variant_path = None
+            progress(
+                f"terminal holdout blend: variant={variant}, "
+                f"components={spec['blend_components']}"
+            )
+        else:
+            (
+                variant_train_segments, variant_train_hat,
+                variant_y_train, variant_w_train, variant_train_times,
+                variant_train_patches,
+            ) = target_holdout_training_view(spec)
+            target_train_x, target_valid_x = target_experiment_matrices(
+                args, cache_dir, variant_train_segments, valid_segments,
+                variant_train_hat, valid_hat, spec,
+                variant_train_times, valid_times,
+                train_patches=variant_train_patches,
+                valid_patches=session_patch(holdout_cold_prefix),
+            )
+            variant_path = model_dir / f"target_{variant}.txt"
+            progress(
+                f"terminal holdout fit: variant={variant}, "
+                f"rounds={cv_result['mean_iterations']}, "
+                f"window={spec.get('train_window_fraction', 1.0):.2f}"
+            )
+            target_model = train_lgb_fixed(
+                target_train_x, variant_y_train, variant_w_train,
+                cv_result["mean_iterations"], args,
+                f"target holdout {variant}",
+                categorical_feature=[spec["feature_names"].index("asset_id")],
+                profile=selected_target_profile,
+            )
+            target_model.save_model(str(variant_path))
+            prediction = predict_sequence(
+                target_model, target_valid_x, f"target holdout {variant}"
+            )
+        if variant in blend_holdout_components:
+            holdout_predictions[variant] = np.asarray(
+                prediction, dtype=np.float32
+            )
         holdout_clip = clipping_diagnostics(
             y_valid, prediction, valid_w,
             (cv_result["clip_min"], cv_result["clip_max"]),
@@ -2395,26 +2851,34 @@ def main():
             "holdout_clipped": holdout_clip["clipped_score"],
             "holdout_clipping_delta": holdout_clip["clipping_delta"],
             "clipping_enabled": clipping_enabled,
-            "features": target_model.num_feature(),
+            "features": len(spec["feature_names"]),
             "best_iteration": cv_result["mean_iterations"],
-            "file": variant_path.name,
+            "file": variant_path.name if variant_path is not None else None,
+            "component_files": (
+                component_files if spec.get("virtual_blend") else None
+            ),
             "temporal_groups": spec["temporal_groups"],
             "responders": spec["responders"],
             "segmented_validation": segmented,
             "holdout_prediction": prediction,
             "holdout_evaluated": True,
         })
-        importance_frames.append(pd.DataFrame({
-            "variant": variant,
-            "feature": spec["feature_names"],
-            "importance_gain": target_model.feature_importance(importance_type="gain"),
-            "importance_split": target_model.feature_importance(importance_type="split"),
-        }))
+        if target_model is not None:
+            importance_frames.append(pd.DataFrame({
+                "variant": variant,
+                "feature": spec["feature_names"],
+                "importance_gain": target_model.feature_importance(
+                    importance_type="gain"
+                ),
+                "importance_split": target_model.feature_importance(
+                    importance_type="split"
+                ),
+            }))
         progress_bar(
             "target holdout", index, len(holdout_variants),
             f"{variant}, raw={holdout_clip['raw_score']:.8f}",
         )
-        if args.training_data_mode == "in-memory":
+        if args.training_data_mode == "in-memory" and target_model is not None:
             del target_train_x, target_valid_x
             gc.collect()
 
@@ -2491,6 +2955,8 @@ def main():
     conservative_fallbacks = [
         name for name in deployable_ranked
         if not experiment_specs[name].get("stable_source")
+        and not experiment_specs[name].get("stable_feature_parent")
+        and not experiment_specs[name].get("virtual_blend")
     ]
     best_variant = (
         passing[0]
@@ -2521,8 +2987,7 @@ def main():
 
     progress(
         f"refitting selected target {best_variant} with validation labels: "
-        f"profile={selected_target_profile}, rounds={best_rounds}, "
-        f"seeds={target_seeds}"
+        f"profile={selected_target_profile}, seeds={target_seeds}"
     )
     refit_oof_x, refit_valid_x = target_experiment_matrices(
         args, cache_dir, oof_segments, valid_segments, oof_hat, valid_hat,
@@ -2540,9 +3005,70 @@ def main():
         vector_for_segments(cache_dir, oof_segments, "weight"), valid_w
     ])
     target_refit_rows = len(target_refit_y)
+    refit_sources = {"full": target_refit_x}
+    refit_targets = {"full": target_refit_y}
+    refit_weights = {"full": target_refit_w}
+    if best_spec.get("virtual_blend"):
+        refit_times = times[times >= int(train_times[warmup_index])]
+        recent_steps = max(
+            1, int(np.ceil(
+                len(refit_times) * args.recent_window_fraction
+            ))
+        )
+        recent_start_time = int(refit_times[-recent_steps])
+        prefix_segments = segments_for_range(
+            cache_dir, metadata, int(train_times[warmup_index]),
+            recent_start_time,
+        )
+        recent_row_offset = sum(
+            end - start for _, start, end in prefix_segments
+        )
+        refit_sources["recent50"] = slice_training_matrix(
+            args, target_refit_x, recent_row_offset
+        )
+        refit_targets["recent50"] = target_refit_y[recent_row_offset:]
+        refit_weights["recent50"] = target_refit_w[recent_row_offset:]
+        component_rounds = best_result["component_mean_iterations"]
+        component_weights = best_spec["blend_components"]
+        component_plan = [
+            (
+                "full", int(component_rounds["full"]),
+                float(component_weights["LGB468_C4_STABLE"]),
+            ),
+            (
+                "recent50", int(component_rounds["recent"]),
+                float(component_weights[
+                    "LGB468_C4_STABLE_RECENT50"
+                ]),
+            ),
+        ]
+        progress(
+            f"final temporal blend: recent_start_time={recent_start_time}, "
+            f"recent_rows={len(refit_targets['recent50']):,}/"
+            f"{target_refit_rows:,}, weights={component_weights}"
+        )
+    else:
+        component_plan = [("full", best_rounds, 1.0)]
+
     target_model_files = []
-    for model_index, seed in enumerate(target_seeds, start=1):
-        filename = f"target_final_seed{seed}.txt"
+    target_model_weights = []
+    model_jobs = []
+    for component, rounds, component_weight in component_plan:
+        for seed in target_seeds:
+            filename = (
+                f"target_final_seed{seed}.txt"
+                if len(component_plan) == 1 else
+                f"target_final_{component}_seed{seed}.txt"
+            )
+            model_jobs.append((
+                component, rounds, seed, filename,
+                component_weight / len(target_seeds),
+            ))
+    expected_model_files = [job[3] for job in model_jobs]
+    expected_model_weights = [job[4] for job in model_jobs]
+    for model_index, (
+        component, rounds, seed, filename, model_weight,
+    ) in enumerate(model_jobs, start=1):
         target_seed_path = model_dir / filename
         can_load = bool(
             args.skip_existing_models
@@ -2551,6 +3077,10 @@ def main():
             and existing_model_metadata.get("target_variant") == best_variant
             and existing_model_metadata.get("target_feature_columns")
             == best_spec["feature_names"]
+            and existing_model_metadata.get("target_models")
+            == expected_model_files
+            and existing_model_metadata.get("target_model_weights")
+            == expected_model_weights
         )
         if can_load:
             target_model = lgb.Booster(model_file=str(target_seed_path))
@@ -2561,12 +3091,14 @@ def main():
             progress(f"loading existing final target model: {filename}")
         else:
             progress(
-                f"training final target {model_index}/{len(target_seeds)}: "
-                f"seed={seed}, rows={len(target_refit_x):,}"
+                f"training final target {model_index}/{len(model_jobs)}: "
+                f"component={component}, seed={seed}, "
+                f"rows={len(refit_sources[component]):,}, rounds={rounds}"
             )
             target_model = train_lgb_fixed(
-                target_refit_x, target_refit_y, target_refit_w,
-                best_rounds, args, f"final target seed={seed}",
+                refit_sources[component], refit_targets[component],
+                refit_weights[component], rounds, args,
+                f"final target {component} seed={seed}",
                 categorical_feature=[
                     best_spec["feature_names"].index("asset_id")
                 ],
@@ -2575,16 +3107,17 @@ def main():
             )
             target_model.save_model(str(target_seed_path))
         target_model_files.append(filename)
+        target_model_weights.append(model_weight)
         progress_bar(
-            "final target ensemble", model_index, len(target_seeds),
-            f"seed={seed}",
+            "final target ensemble", model_index, len(model_jobs),
+            f"component={component}, seed={seed}",
         )
     # Keep the historical filename as an alias for older tooling.
     target_model = lgb.Booster(
         model_file=str(model_dir / target_model_files[0])
     )
     target_model.save_model(str(model_dir / "target_lightgbm.txt"))
-    del target_refit_y, target_refit_w
+    del target_refit_y, target_refit_w, refit_targets, refit_weights
     if args.training_data_mode == "in-memory":
         del refit_oof_x, refit_valid_x, target_refit_x
         gc.collect()
@@ -2646,6 +3179,7 @@ def main():
              "target_parameter_search": parameter_search,
              "selected_target_profile": selected_target_profile,
              "stable_feature_selection": stable_feature_selection,
+             "temporal_blend": temporal_blend_report,
              "responder_diagnostics": responder_diagnostics,
              "c4_mechanism": mechanism_summary},
             indent=2,
@@ -2678,6 +3212,7 @@ def main():
         "responder_models": responder_files,
         "target_model": "target_lightgbm.txt",
         "target_models": target_model_files,
+        "target_model_weights": target_model_weights,
         "target_seeds": target_seeds,
         "target_variant": best_variant,
         "target_base_indices": best_spec["base_indices"],
@@ -2700,6 +3235,10 @@ def main():
             "stable_feature_report.csv" if stable_feature_selection else None
         ),
         "stable_feature_selection": stable_feature_selection,
+        "temporal_blend_report": (
+            "temporal_blend_report.json" if temporal_blend_report else None
+        ),
+        "temporal_blend": temporal_blend_report,
         "ablation_report": "ablation_report.json",
         "valid_cutoff_time_id": valid_cutoff, "oof_folds": args.oof_folds,
         "purge_steps": args.purge_steps,

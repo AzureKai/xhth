@@ -4,7 +4,7 @@
 
 ## 当前模型
 
-正式模型从 `LGB468_C4` 及其跨折稳定删列版本 `LGB468_C4_STABLE` 中选择。名称中的 `C4` 为兼容现有产物而保留，当前实际只使用两个 responder。
+正式模型沿用 `LGB468_C4` 主线，并比较跨折稳定删列的全历史模型与“全历史 + 最近窗口”融合模型。名称中的 `C4` 为兼容现有产物而保留，当前实际只使用两个 responder。
 
 完整候选输入共 470 列：
 
@@ -22,7 +22,7 @@
 
 `asset_id` 作为 LightGBM categorical feature，时序特征只能使用当前 `time_id` 之前的数据。
 
-训练会读取 `LGB468_C4` 的每个 development CV 折模型，统计特征在各折是否被使用以及归一化 gain 的稳定性。默认保留至少 75% 折出现的特征，最多保留 420 列；不足 320 列时按稳定分数回填。`asset_id` 和两个 responder_hat 始终保留。删列候选必须在 walk-forward 和未参与筛选的 terminal holdout 上通过相对完整模型的晋级门槛，才允许部署。
+训练会读取 `LGB468_C4` 的每个 development CV 折模型，统计特征在各折是否被使用以及归一化 gain 的稳定性。默认保留至少 75% 折出现的特征，最多保留 420 列；不足 320 列时按稳定分数回填。`asset_id` 和两个 responder_hat 始终保留。随后使用同一稳定特征集训练全历史模型和只读取每折最新 50% 历史的模型，并仅在 development OOF 上从预设的最近模型权重 `0.25/0.5/0.75` 中选择融合权重。OOF 折数、边界和 purge 均保持不变，terminal holdout 不参与调权。
 
 ## 主要文件
 
@@ -74,32 +74,37 @@ python3 examples/responder_assisted_lgb_catboost_strategy/train.py --data-root d
 - `lambda_l1=2`，`lambda_l2=30`，`path_smooth=150`。
 - 最后 15% 时间作为 terminal holdout。
 - development 区间使用 5 折 expanding-window OOF，切分边界 purge 30 个时间步。
-- target 使用种子 2026、2027、2028 重训，推理取三个模型均值。
+- target 使用种子 2026、2027、2028 重训；单模型候选取三个种子均值，融合候选按 OOF 冻结的组件权重组合两组三种子模型。
 - 稳定筛选默认 `min_fold_rate=0.75`、`min_count=320`、`max_count=420`。
+- 最近窗口默认使用可用历史的 50%；融合最近模型权重候选固定为 `0.25,0.5,0.75`。
 
 缓存会绑定数据文件指纹、特征配方、responder 列表和 LightGBM 配置版本。配置不兼容时会自动重建，`--skip-existing-models` 不会复用旧模型。
 
 ### 当前对照模型
 
-默认 `next-step` 套件训练五个模型：
+默认 `next-step` 套件评估七个模型：
 
 - `A`：323 个原始 feature 和 categorical `asset_id`。
 - `C4`：A 加两个 OOF responder 预测。
 - `LGB468`：468 列基础输入，不使用 responder 预测。
 - `LGB468_C4`：468 列基础输入加两个 OOF responder 预测，共 470 列。
 - `LGB468_C4_STABLE`：从 `LGB468_C4` 各折重要性中筛出的 320～420 列稳定子集。
+- `LGB468_C4_STABLE_RECENT50`：相同稳定特征，但每折仅使用当时可见历史中最新的 50%，作为漂移对照。
+- `LGB468_C4_STABLE_BLEND`：全历史稳定模型与 RECENT50 的 OOF 加权融合。
 
-前三个模型仅作对照；正式部署候选为 `LGB468_C4` 和 `LGB468_C4_STABLE`。选型先比较 development walk-forward 分数，再检查 terminal holdout、预测尺度、裁剪和晋级门槛。稳定删列版本若未通过相对完整模型的全部门槛，不会作为保守回退模型。holdout 不直接用于挑选最高分模型。
+前三个模型和 RECENT50 单模型仅作对照；正式部署候选为 `LGB468_C4`、`LGB468_C4_STABLE` 和融合模型。选型先比较 development walk-forward 分数，再检查 terminal holdout、预测尺度、裁剪和晋级门槛。稳定模型必须直接胜过 `C4`，融合模型必须直接胜过稳定全历史模型和 `C4`；动态候选失败时不会被当作保守回退模型。holdout 不直接用于挑选最高分模型或融合权重。
 
 ### 训练产物
 
 - `model/metadata.json`：特征顺序、responder 列表、验证协议、分数和模型清单。
-- `model/target_final_seed*.txt`：三个种子的最终 target 模型。
+- `model/target_final_seed*.txt`：单模型候选胜出时的三个种子模型。
+- `model/target_final_full_seed*.txt`、`model/target_final_recent50_seed*.txt`：融合候选胜出时的两组三种子模型。
 - `model/target_lightgbm.txt`：首个种子模型的兼容别名。
 - `model/responder_*.txt`：最终 responder 模型。
 - `model/target_feature_importance.csv`：target 特征重要性。
 - `model/stable_feature_report.csv`：逐特征跨折出现率、归一化 gain、稳定分数和保留原因。
 - `model/stable_feature_selection.json`：稳定筛选参数及最终特征清单。
+- `model/temporal_blend_report.json`：预设权重的 OOF 分数和冻结后的融合权重。
 - `model/ablation_report.json`：对照模型和选型结果。
 - `work/cache/`：预处理后的缓存分片。
 - `work/selection_responder_models/`：仅用于验证的 responder 模型。
@@ -122,7 +127,7 @@ python3 examples/responder_assisted_lgb_catboost_strategy/audit_responders.py --
 python3 timeseries_api/run_timeseries_api.py --data-root data --strategy-dir examples/responder_assisted_lgb_catboost_strategy --output examples/responder_assisted_lgb_catboost_strategy/submission.csv
 ```
 
-推理要求 `time_id` 递增。每个时间步先更新历史状态，再预测两个 responder_hat，最后由三个 target 模型的均值生成结果。推理过程显示完成行数、当前 `time_id`、耗时和预计剩余时间。
+推理要求 `time_id` 递增。每个时间步先更新历史状态，再预测两个 responder_hat，最后按 `metadata.json` 中的 `target_model_weights` 对 target 模型加权求和。推理过程显示完成行数、当前 `time_id`、耗时和预计剩余时间。
 
 ## 约束
 

@@ -8,6 +8,24 @@ import numpy as np
 from temporal_features import TemporalFeatureBuilder
 
 
+def normalized_model_weights(values, model_count: int) -> np.ndarray:
+    """Validate persisted ensemble weights and normalize small roundoff."""
+    if values is None:
+        values = [1.0] * model_count
+    weights = np.asarray(values, dtype=np.float64)
+    if (
+        len(weights) != model_count
+        or not np.all(np.isfinite(weights))
+        or np.any(weights < 0.0)
+        or float(weights.sum()) <= 0.0
+    ):
+        raise ValueError(
+            "target_model_weights must be finite non-negative values "
+            "matching target_models"
+        )
+    return weights / weights.sum()
+
+
 class Model:
     def __init__(self, model_dir=None):
         import lightgbm as lgb
@@ -61,6 +79,10 @@ class Model:
             lgb.Booster(model_file=str(model_dir / filename))
             for filename in target_model_files
         ]
+        self.target_model_weights = normalized_model_weights(
+            self.metadata.get("target_model_weights"),
+            len(self.target_models),
+        )
         self.target_model = self.target_models[0]
         self.target_variant = str(self.metadata.get("target_variant", "D"))
         self.base_feature_count = (
@@ -167,10 +189,12 @@ class Model:
         target_x = np.hstack(
             [base[:, self.target_base_indices], responder_hat]
         )
-        prediction = np.mean(
+        prediction = np.sum(
             [
-                np.asarray(model.predict(target_x), dtype=np.float64)
-                for model in self.target_models
+                np.asarray(model.predict(target_x), dtype=np.float64) * weight
+                for model, weight in zip(
+                    self.target_models, self.target_model_weights
+                )
             ],
             axis=0,
         ) * self.scale
