@@ -1695,6 +1695,7 @@ def main():
     final_files.extend([
         model_dir / "target_lightgbm.txt",
         model_dir / "metadata.json",
+        model_dir / "development_oof_predictions.npz",
         model_dir / "validation_predictions.npz",
         model_dir / "feature_health_report.json",
     ])
@@ -2177,13 +2178,15 @@ def main():
     target_cv_results = {}
     target_cv_fold_predictions = {}
     target_cv_variant_dirs = {}
-    blend_prediction_variants = (
-        {
+    blend_prediction_variants = {
+        name for name in (
+            "C4",
+            "LGB468_C4",
             "LGB468_C4_STABLE",
             "LGB468_C4_STABLE_RECENT50",
-        }
-        if "LGB468_C4_STABLE_BLEND" in variants else set()
-    )
+        )
+        if name in variants
+    }
 
     def target_cv_model_path(variant, profile, fold):
         spec = experiment_specs[variant]
@@ -2973,6 +2976,56 @@ def main():
     best_spec = experiment_specs[best_variant]
     best_result = ablation_scores[best_variant]
     best_rounds = int(best_result["mean_iterations"])
+    selected_oof_key = (best_variant, selected_target_profile)
+    if selected_oof_key not in target_cv_fold_predictions:
+        raise ValueError(
+            f"selected target OOF predictions are unavailable: {selected_oof_key}"
+        )
+    selected_fold_predictions = target_cv_fold_predictions[selected_oof_key]
+    if len(selected_fold_predictions) != len(target_cv_records):
+        raise ValueError("selected target OOF fold count mismatch")
+    development_times = []
+    development_assets = []
+    development_targets = []
+    development_weights = []
+    development_predictions = []
+    development_fold_ids = []
+    for record, prediction in zip(
+        target_cv_records, selected_fold_predictions
+    ):
+        segments = record["segments"]
+        prediction = np.asarray(prediction, dtype=np.float32)
+        if best_result["clipping_enabled"]:
+            prediction = np.clip(
+                prediction, best_result["clip_min"], best_result["clip_max"]
+            )
+        development_times.append(
+            vector_for_segments(cache_dir, segments, "time").astype(np.int64)
+        )
+        development_assets.append(
+            vector_for_segments(cache_dir, segments, "x", column=-1).astype(
+                np.int16
+            )
+        )
+        development_targets.append(
+            vector_for_segments(cache_dir, segments, "target").astype(np.float32)
+        )
+        development_weights.append(
+            vector_for_segments(cache_dir, segments, "weight").astype(np.float32)
+        )
+        development_predictions.append(prediction)
+        development_fold_ids.append(np.full(
+            len(prediction), int(record["fold"]), dtype=np.int8
+        ))
+    np.savez_compressed(
+        model_dir / "development_oof_predictions.npz",
+        time_id=np.concatenate(development_times),
+        asset_id=np.concatenate(development_assets),
+        fold_id=np.concatenate(development_fold_ids),
+        target=np.concatenate(development_targets),
+        weight=np.concatenate(development_weights),
+        prediction=np.concatenate(development_predictions),
+    )
     valid_pred_raw = np.asarray(best_result.pop("holdout_prediction"))
     for name, result in ablation_scores.items():
         if name != best_variant:
@@ -3223,6 +3276,8 @@ def main():
         "trained_target_experiments": variants,
         "target_validation_protocol": "purged_walk_forward_then_terminal_holdout",
         "validation_history": "cold_start_per_fold",
+        "development_oof_predictions": "development_oof_predictions.npz",
+        "validation_predictions": "validation_predictions.npz",
         "cv_winner": cv_winner,
         "terminal_holdout_variants": holdout_variants,
         "target_parameter_search": parameter_search,

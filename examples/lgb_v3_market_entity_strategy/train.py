@@ -123,6 +123,20 @@ def read_vector_spans(path: Path, spans: list[tuple[int, int]]) -> np.ndarray:
     ])
 
 
+def read_column_spans(
+    path: Path,
+    spans: list[tuple[int, int]],
+    column: int,
+) -> np.ndarray:
+    source = np.load(path, mmap_mode="r")
+    if len(spans) == 1:
+        start, end = spans[0]
+        return np.asarray(source[start:end, column]).copy()
+    return np.concatenate([
+        np.asarray(source[start:end, column]) for start, end in spans
+    ])
+
+
 class CombinedEntitySequence(lgb.Sequence):
     batch_size = baseline.SEQUENCE_BATCH_ROWS
 
@@ -383,18 +397,27 @@ def main() -> None:
         "early_stopping": args.early_stopping,
     }
     metadata_path = model_dir / "metadata.json"
+    development_oof_path = model_dir / "development_oof_predictions.npz"
+    validation_prediction_path = model_dir / "validation_predictions.npz"
+    existing = None
+    compatible_existing_final = False
     if args.skip_existing_models and metadata_path.exists():
         existing = json.loads(metadata_path.read_text(encoding="utf-8"))
         model_files = [
             model_dir / filename for filename in existing.get("entity_models", [])
         ]
-        if (
+        compatible_existing_final = bool(
             int(existing.get("schema_version", 0)) == SCHEMA_VERSION
             and all(existing.get("training_config", {}).get(key) == value
                     for key, value in requested_config.items())
             and existing.get("source_artifacts") == source_fingerprints
             and all(path.exists() for path in model_files)
             and (model_dir / "entity_feature_importance.csv").exists()
+        )
+        if (
+            compatible_existing_final
+            and development_oof_path.exists()
+            and validation_prediction_path.exists()
         ):
             progress("all compatible final artifacts exist; training skipped")
             print(metadata_path.read_text(encoding="utf-8"))
@@ -692,6 +715,59 @@ def main() -> None:
         holdout_base + beta * holdout_prediction,
         holdout_weight,
     )
+    progress("saving aligned development OOF and terminal holdout predictions")
+    asset_column = source_names.index("asset_id")
+    development_times = []
+    development_assets = []
+    development_targets = []
+    development_weights = []
+    development_predictions = []
+    development_fold_ids = []
+    for index, fold in enumerate(folds):
+        positions = fold_positions[index + 1]
+        spans = fold_spans[index + 1]
+        counts = row_offsets[positions + 1] - row_offsets[positions]
+        prediction = (
+            fold["base"] + beta * fold["entity_prediction"]
+        )
+        development_times.append(np.repeat(unique_times[positions], counts))
+        development_assets.append(
+            read_column_spans(source_feature_path, spans, asset_column)
+        )
+        development_targets.append(fold["target"])
+        development_weights.append(fold["weight"])
+        development_predictions.append(prediction)
+        development_fold_ids.append(np.full(
+            len(prediction), fold["fold_id"], dtype=np.int8
+        ))
+    np.savez_compressed(
+        development_oof_path,
+        time_id=np.concatenate(development_times).astype(np.int64, copy=False),
+        asset_id=np.concatenate(development_assets).astype(np.int16, copy=False),
+        fold_id=np.concatenate(development_fold_ids),
+        target=np.concatenate(development_targets).astype(np.float32, copy=False),
+        weight=np.concatenate(development_weights).astype(np.float32, copy=False),
+        prediction=np.concatenate(development_predictions).astype(
+            np.float32, copy=False
+        ),
+    )
+    holdout_counts = (
+        row_offsets[holdout_positions + 1] - row_offsets[holdout_positions]
+    )
+    np.savez_compressed(
+        validation_prediction_path,
+        time_id=np.repeat(
+            unique_times[holdout_positions], holdout_counts
+        ).astype(np.int64, copy=False),
+        asset_id=read_column_spans(
+            source_feature_path, holdout_spans, asset_column
+        ).astype(np.int16, copy=False),
+        target=np.asarray(holdout_target, dtype=np.float32),
+        weight=np.asarray(holdout_weight, dtype=np.float32),
+        prediction=np.asarray(
+            holdout_base + beta * holdout_prediction, dtype=np.float32
+        ),
+    )
     fold_deltas = np.asarray(selected["fold_deltas"], dtype=np.float64)
     gates = {
         "entity_weight_positive": bool(beta > 0.0),
@@ -705,26 +781,36 @@ def main() -> None:
 
     entity_model_files = []
     if deployment_beta > 0.0:
-        final_spans = [*development_spans, *holdout_spans]
-        final_set = build_entity_dataset(
-            source_feature_path, source_columns, extra_feature_path,
-            entity_label_path, weight_path, final_spans,
-            model_feature_names,
+        expected_files = [f"entity_seed{seed}.txt" for seed in FINAL_SEEDS]
+        reuse_final_models = bool(
+            args.skip_existing_models
+            and compatible_existing_final
+            and all((model_dir / filename).exists() for filename in expected_files)
         )
-        for index, seed in enumerate(FINAL_SEEDS, start=1):
-            progress(
-                f"final entity fit {index}/{len(FINAL_SEEDS)}: "
-                f"seed={seed}, rounds={mean_rounds}"
+        if reuse_final_models:
+            progress("reusing compatible final entity ensemble")
+            entity_model_files = expected_files
+        else:
+            final_spans = [*development_spans, *holdout_spans]
+            final_set = build_entity_dataset(
+                source_feature_path, source_columns, extra_feature_path,
+                entity_label_path, weight_path, final_spans,
+                model_feature_names,
             )
-            model = train_entity(
-                final_set, None, mean_rounds,
-                args.early_stopping, args.threads, seed,
-            )
-            filename = f"entity_seed{seed}.txt"
-            model.save_model(str(model_dir / filename))
-            entity_model_files.append(filename)
-            del model
-        del final_set
+            for index, seed in enumerate(FINAL_SEEDS, start=1):
+                progress(
+                    f"final entity fit {index}/{len(FINAL_SEEDS)}: "
+                    f"seed={seed}, rounds={mean_rounds}"
+                )
+                model = train_entity(
+                    final_set, None, mean_rounds,
+                    args.early_stopping, args.threads, seed,
+                )
+                filename = f"entity_seed{seed}.txt"
+                model.save_model(str(model_dir / filename))
+                entity_model_files.append(filename)
+                del model
+            del final_set
 
     del development_set, holdout_model
     metadata = {
@@ -766,6 +852,8 @@ def main() -> None:
         },
         "promotion_gates": gates,
         "feature_importance": "entity_feature_importance.csv",
+        "development_oof_predictions": development_oof_path.name,
+        "validation_predictions": validation_prediction_path.name,
         "training_config": {
             **requested_config,
             "threads": args.threads,
