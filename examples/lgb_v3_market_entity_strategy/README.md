@@ -93,3 +93,20 @@ python3 examples/lgb_v3_market_entity_strategy/train.py --data-root data --base-
 - `<variant>/feature_importance.csv`：该组 terminal holdout 模型的重要性。
 
 `--skip-existing-models` 会复用签名完全一致的折模型和 prior 外存；修改 prior 收缩强度或 feature schema 后会自动失效重算。
+
+## 保留 Asset ID 的残差 prior 消融
+
+身份消融显示 categorical `asset_id` 仍然稳定有效，而简单冻结 prior 只能部分替代它。`run_entity_prior_ablation.py` 因此保留完整生产特征，并比较：
+
+- `full`：当前生产模型，直接复用已有报告。
+- `full_global_prior`：增加全历史收缩残差均值。
+- `full_ema50_prior`：增加半衰期 50 的近期残差 EMA。
+- `full_multiscale_prior`：同时增加半衰期 50 和 200 的残差 EMA。
+
+训练行的所有 prior 都只能使用更早时间的标签；validation 和 holdout 使用训练期末冻结状态。该实验只输出审计结果，不会自动替换生产模型。一行生产训练、prior 消融和推理命令：
+
+```bash
+python3 examples/lgb_v3_market_entity_strategy/train.py --data-root data --base-model-dir examples/lightgbm_baseline/model_forward_lowrisk_v3 --base-cache-dir examples/lightgbm_baseline/.low_memory_cache_forward_v2 --source-work-dir examples/lgb_v3_regime_residual_strategy/work --work-dir examples/lgb_v3_market_entity_strategy/work --model-dir examples/lgb_v3_market_entity_strategy/model --state-feature-count 16 --extra-cross-z-count 8 --entity-weights 0,0.02,0.05,0.10,0.20,0.35,0.50,0.75,1.0 --entity-rounds 500 --threads 8 --skip-existing-models && python3 examples/lgb_v3_market_entity_strategy/run_entity_prior_ablation.py --data-root data --base-model-dir examples/lightgbm_baseline/model_forward_lowrisk_v3 --base-cache-dir examples/lightgbm_baseline/.low_memory_cache_forward_v2 --source-work-dir examples/lgb_v3_regime_residual_strategy/work --work-dir examples/lgb_v3_market_entity_strategy/work --model-dir examples/lgb_v3_market_entity_strategy/model --prior-shrinkage 100 --entity-rounds 500 --threads 8 --skip-existing-models && python3 timeseries_api/run_timeseries_api.py --data-root data --strategy-dir examples/lgb_v3_market_entity_strategy --output examples/lgb_v3_market_entity_strategy/submission.csv
+```
+
+结果位于 `work/entity_prior_ablation/`：`summary.json`、`summary.csv`，以及三个增强组各自的 `report.json` 和 `feature_importance.csv`。只有某个 prior 方案同时提高平均 CV、最新折和 terminal holdout，才值得实现为生产推理特征。

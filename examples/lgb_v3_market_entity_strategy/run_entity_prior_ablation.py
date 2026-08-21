@@ -4,31 +4,40 @@ import argparse
 import csv
 import gc
 import json
+import math
 import time
 from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
 
+import run_entity_identity_ablation as identity
 import train as strategy_train
 
 
 START = time.perf_counter()
-ABLATION_SCHEMA_VERSION = 1
-DEFAULT_VARIANTS = ("full", "no_asset_id", "frozen_prior")
-FROZEN_PRIOR_NAME = "frozen_entity_residual_prior"
+SCHEMA_VERSION = 1
+VARIANT_SPECS = {
+    "full_global_prior": [
+        ("frozen_entity_residual_prior", None),
+    ],
+    "full_ema50_prior": [
+        ("frozen_entity_residual_ema50", 50.0),
+    ],
+    "full_multiscale_prior": [
+        ("frozen_entity_residual_ema50", 50.0),
+        ("frozen_entity_residual_ema200", 200.0),
+    ],
+}
 
 
 def progress(message: str) -> None:
-    elapsed = time.perf_counter() - START
-    print(f"[ablation {elapsed:9.1f}s] {message}", flush=True)
+    print(f"[prior-ablation {time.perf_counter() - START:9.1f}s] {message}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Time-safe entity identity ablation for the V3 residual strategy."
-        )
+        description="Time-safe residual priors added on top of categorical asset_id."
     )
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--base-model-dir", required=True)
@@ -41,8 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", required=True)
     parser.add_argument(
         "--variants",
-        default=",".join(DEFAULT_VARIANTS),
-        help="Comma-separated subset of full,no_asset_id,frozen_prior.",
+        default="full," + ",".join(VARIANT_SPECS),
+        help=(
+            "Comma-separated subset of full,full_global_prior,"
+            "full_ema50_prior,full_multiscale_prior."
+        ),
     )
     parser.add_argument("--prior-shrinkage", type=float, default=100.0)
     parser.add_argument("--entity-rounds", type=int, default=500)
@@ -53,202 +65,78 @@ def parse_args() -> argparse.Namespace:
 
 
 def configured_variants(value: str) -> list[str]:
-    requested = []
+    allowed = {"full", *VARIANT_SPECS}
+    result = []
     for item in value.split(","):
         name = item.strip()
-        if name and name not in requested:
-            requested.append(name)
-    unknown = sorted(set(requested) - set(DEFAULT_VARIANTS))
+        if name and name not in result:
+            result.append(name)
+    unknown = sorted(set(result) - allowed)
     if unknown:
-        raise ValueError(f"unknown ablation variants: {unknown}")
-    if not requested:
-        raise ValueError("at least one ablation variant is required")
-    return requested
+        raise ValueError(f"unknown prior ablation variants: {unknown}")
+    if not result:
+        raise ValueError("at least one prior ablation variant is required")
+    return result
 
 
-class AblationEntitySequence(lgb.Sequence):
-    batch_size = strategy_train.baseline.SEQUENCE_BATCH_ROWS
-
-    def __init__(
-        self,
-        source_feature_path: Path,
-        source_columns: list[int],
-        extra_feature_path: Path,
-        spans: list[tuple[int, int]],
-        appended_feature_path: Path | None = None,
-    ) -> None:
-        source_shape = tuple(np.load(source_feature_path, mmap_mode="r").shape)
-        extra_shape = tuple(np.load(extra_feature_path, mmap_mode="r").shape)
-        self.source = strategy_train.baseline.SpannedMemmapSequence(
-            source_feature_path, source_shape, spans
-        )
-        self.extra = strategy_train.baseline.SpannedMemmapSequence(
-            extra_feature_path, extra_shape, spans
-        )
-        self.source_columns = np.asarray(source_columns, dtype=np.int64)
-        self.appended = (
-            np.load(appended_feature_path, mmap_mode="r")
-            if appended_feature_path is not None
-            else None
-        )
-        if self.appended is not None:
-            if self.appended.ndim not in (1, 2):
-                raise ValueError("appended ablation features must be a vector or matrix")
-            if self.appended.shape[0] != len(self.source):
-                raise ValueError(
-                    "appended ablation feature length does not match selected spans"
-                )
-
-    def __len__(self) -> int:
-        return len(self.source)
-
-    def __getitem__(self, index):
-        source = np.asarray(self.source[index])
-        extra = np.asarray(self.extra[index])
-        selected = (
-            source[self.source_columns]
-            if source.ndim == 1
-            else source[:, self.source_columns]
-        )
-        axis = 0 if selected.ndim == 1 else 1
-        parts = [selected, extra]
-        if self.appended is not None:
-            prior = np.asarray(self.appended[index])
-            if selected.ndim == 1:
-                prior = prior.reshape(-1)
-            else:
-                if prior.ndim == 1:
-                    prior = prior.reshape(-1, 1)
-            parts.append(prior)
-        return np.concatenate(parts, axis=axis)
-
-
-def build_dataset(
-    source_feature_path: Path,
-    source_columns: list[int],
-    extra_feature_path: Path,
-    label_path: Path,
-    weight_path: Path,
-    spans: list[tuple[int, int]],
-    feature_names: list[str],
-    appended_feature_path: Path | None = None,
-    reference: lgb.Dataset | None = None,
-) -> lgb.Dataset:
-    sequence = AblationEntitySequence(
-        source_feature_path,
-        source_columns,
-        extra_feature_path,
-        spans,
-        appended_feature_path,
-    )
-    labels = strategy_train.read_vector_spans(label_path, spans).astype(np.float32)
-    weights = strategy_train.read_vector_spans(weight_path, spans).astype(np.float32)
-    categorical = ["asset_id"] if "asset_id" in feature_names else []
-    dataset = lgb.Dataset(
-        sequence,
-        label=labels,
-        weight=weights,
-        reference=reference,
-        feature_name=feature_names,
-        categorical_feature=categorical,
-        params={
-            "data_random_seed": 2026,
-            "min_data_in_leaf": 5000,
-            "max_bin": 255,
-            "force_col_wise": True,
-            "verbosity": -1,
-        },
-        free_raw_data=True,
-    )
-    dataset.construct()
-    return dataset
-
-
-def predict(
-    model: lgb.Booster,
-    source_feature_path: Path,
-    source_columns: list[int],
-    extra_feature_path: Path,
-    spans: list[tuple[int, int]],
-    rounds: int,
-    appended_feature_path: Path | None = None,
-) -> np.ndarray:
-    source = np.load(source_feature_path, mmap_mode="r")
-    extra = np.load(extra_feature_path, mmap_mode="r")
-    appended = (
-        np.load(appended_feature_path, mmap_mode="r")
-        if appended_feature_path is not None
-        else None
-    )
-    parts = []
-    local_cursor = 0
-    for span_start, span_end in spans:
-        for start in range(span_start, span_end, strategy_train.baseline.PREDICT_BATCH_ROWS):
-            end = min(start + strategy_train.baseline.PREDICT_BATCH_ROWS, span_end)
-            values = [
-                np.asarray(source[start:end, source_columns], dtype=np.float32),
-                np.asarray(extra[start:end], dtype=np.float32),
-            ]
-            if appended is not None:
-                count = end - start
-                appended_values = np.asarray(
-                    appended[local_cursor:local_cursor + count],
-                    dtype=np.float32,
-                )
-                if appended_values.ndim == 1:
-                    appended_values = appended_values.reshape(-1, 1)
-                values.append(appended_values)
-                local_cursor += count
-            matrix = np.column_stack(values)
-            parts.append(np.asarray(
-                model.predict(matrix, num_iteration=rounds, num_threads=1),
-                dtype=np.float64,
-            ))
-    if appended is not None and local_cursor != len(appended):
-        raise ValueError("appended prediction feature was not fully consumed")
-    return np.concatenate(parts)
-
-
-def _write_prior_rows(
-    output: np.memmap,
-    cursor: int,
+def _prior_values(
     assets: np.ndarray,
+    specs: list[tuple[str, float | None]],
     sums: dict[int, float],
     counts: dict[int, int],
+    emas: dict[float, dict[int, float]],
     shrinkage: float,
-) -> int:
+) -> np.ndarray:
     unique, inverse = np.unique(assets, return_inverse=True)
-    mapped = np.asarray([
-        sums.get(int(asset), 0.0) / (counts.get(int(asset), 0) + shrinkage)
-        for asset in unique
-    ], dtype=np.float32)
-    end = cursor + len(assets)
-    output[cursor:end] = mapped[inverse]
-    return end
+    mapped = np.empty((len(unique), len(specs)), dtype=np.float32)
+    for row, asset in enumerate(unique):
+        key = int(asset)
+        count = counts.get(key, 0)
+        reliability = count / (count + shrinkage)
+        for column, (_, half_life) in enumerate(specs):
+            if half_life is None:
+                value = sums.get(key, 0.0) / (count + shrinkage)
+            else:
+                value = reliability * emas[half_life].get(key, 0.0)
+            mapped[row, column] = np.float32(value)
+    return mapped[inverse]
 
 
 def _update_prior_state(
     assets: np.ndarray,
     labels: np.ndarray,
+    specs: list[tuple[str, float | None]],
     sums: dict[int, float],
     counts: dict[int, int],
+    emas: dict[float, dict[int, float]],
 ) -> None:
     unique, inverse = np.unique(assets, return_inverse=True)
     label_sums = np.bincount(inverse, weights=labels, minlength=len(unique))
     label_counts = np.bincount(inverse, minlength=len(unique))
-    for index, asset in enumerate(unique):
+    half_lives = sorted({half_life for _, half_life in specs if half_life is not None})
+    for row, asset in enumerate(unique):
         key = int(asset)
-        sums[key] = sums.get(key, 0.0) + float(label_sums[index])
-        counts[key] = counts.get(key, 0) + int(label_counts[index])
+        observation = float(label_sums[row] / max(label_counts[row], 1))
+        sums[key] = sums.get(key, 0.0) + float(label_sums[row])
+        previous_count = counts.get(key, 0)
+        counts[key] = previous_count + int(label_counts[row])
+        for half_life in half_lives:
+            state = emas[half_life]
+            if previous_count == 0:
+                state[key] = observation
+            else:
+                alpha = 1.0 - math.exp(math.log(0.5) / half_life)
+                state[key] = (1.0 - alpha) * state[key] + alpha * observation
 
 
-def materialize_frozen_prior(
+def materialize_temporal_priors(
     source_feature_path: Path,
     asset_column: int,
     label_path: Path,
     train_positions: np.ndarray,
     valid_positions: np.ndarray,
     row_offsets: np.ndarray,
+    specs: list[tuple[str, float | None]],
     shrinkage: float,
     train_path: Path,
     valid_path: Path,
@@ -262,52 +150,71 @@ def materialize_frozen_prior(
         row_offsets[valid_positions + 1] - row_offsets[valid_positions]
     ))
     train_output = np.lib.format.open_memmap(
-        train_path, mode="w+", dtype=np.float32, shape=(train_rows,)
+        train_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(train_rows, len(specs)),
     )
     valid_output = np.lib.format.open_memmap(
-        valid_path, mode="w+", dtype=np.float32, shape=(valid_rows,)
+        valid_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(valid_rows, len(specs)),
     )
     sums: dict[int, float] = {}
     counts: dict[int, int] = {}
+    emas = {
+        half_life: {}
+        for _, half_life in specs
+        if half_life is not None
+    }
     cursor = 0
     report_every = max(1, len(train_positions) // 20)
     for completed, position in enumerate(train_positions, start=1):
         start = int(row_offsets[position])
         end = int(row_offsets[position + 1])
         assets = np.asarray(source[start:end, asset_column], dtype=np.int64)
-        cursor = _write_prior_rows(
-            train_output, cursor, assets, sums, counts, shrinkage
+        next_cursor = cursor + len(assets)
+        train_output[cursor:next_cursor] = _prior_values(
+            assets, specs, sums, counts, emas, shrinkage
         )
         _update_prior_state(
             assets,
             np.asarray(labels[start:end], dtype=np.float64),
+            specs,
             sums,
             counts,
+            emas,
         )
+        cursor = next_cursor
         if completed == len(train_positions) or completed % report_every == 0:
             strategy_train.progress_bar(
-                "frozen prior train", completed, len(train_positions),
-                f"entities={len(counts)}",
+                "temporal prior train",
+                completed,
+                len(train_positions),
+                f"entities={len(counts)}, features={len(specs)}",
             )
     if cursor != train_rows:
-        raise ValueError("causal prior train row count mismatch")
+        raise ValueError("temporal prior train row count mismatch")
     cursor = 0
     for position in valid_positions:
         start = int(row_offsets[position])
         end = int(row_offsets[position + 1])
         assets = np.asarray(source[start:end, asset_column], dtype=np.int64)
-        cursor = _write_prior_rows(
-            valid_output, cursor, assets, sums, counts, shrinkage
+        next_cursor = cursor + len(assets)
+        valid_output[cursor:next_cursor] = _prior_values(
+            assets, specs, sums, counts, emas, shrinkage
         )
+        cursor = next_cursor
     if cursor != valid_rows:
-        raise ValueError("frozen prior validation row count mismatch")
+        raise ValueError("temporal prior validation row count mismatch")
     train_output.flush()
     valid_output.flush()
     del source, labels, train_output, valid_output
     gc.collect()
 
 
-def ensure_frozen_prior(
+def ensure_temporal_priors(
     variant_dir: Path,
     split_name: str,
     signature_payload: dict,
@@ -317,85 +224,65 @@ def ensure_frozen_prior(
     train_positions: np.ndarray,
     valid_positions: np.ndarray,
     row_offsets: np.ndarray,
+    specs: list[tuple[str, float | None]],
     shrinkage: float,
     skip_existing: bool,
 ) -> tuple[Path, Path]:
     train_path = variant_dir / f"{split_name}_train_prior.npy"
     valid_path = variant_dir / f"{split_name}_valid_prior.npy"
     stage_path = variant_dir / f"{split_name}_prior.json"
-    prior_signature = strategy_train.signature(signature_payload)
+    current_signature = strategy_train.signature(signature_payload)
     if skip_existing and train_path.exists() and valid_path.exists() and stage_path.exists():
         stage = json.loads(stage_path.read_text(encoding="utf-8"))
-        if stage.get("signature") == prior_signature:
-            progress(f"reusing frozen prior: {split_name}")
+        if stage.get("signature") == current_signature:
+            progress(f"reusing temporal prior: {variant_dir.name}/{split_name}")
             return train_path, valid_path
-    progress(f"materializing time-safe frozen prior: {split_name}")
-    materialize_frozen_prior(
+    progress(f"materializing temporal prior: {variant_dir.name}/{split_name}")
+    materialize_temporal_priors(
         source_feature_path,
         asset_column,
         label_path,
         train_positions,
         valid_positions,
         row_offsets,
+        specs,
         shrinkage,
         train_path,
         valid_path,
     )
     stage_path.write_text(json.dumps({
-        "signature": prior_signature,
+        "signature": current_signature,
         "signature_payload": signature_payload,
     }, indent=2), encoding="utf-8")
     return train_path, valid_path
 
 
-def source_columns_for_variant(
-    variant: str,
-    source_names: list[str],
-    production_names: list[str],
-) -> tuple[list[int], list[str]]:
-    base_names = [
-        name for name in production_names if not name.startswith("cross_z_")
-        or name in source_names
-    ]
-    # Extra cross-z columns are stored in a separate memmap and follow source names.
-    if variant in {"no_asset_id", "frozen_prior"}:
-        base_names = [name for name in base_names if name != "asset_id"]
-    columns = [source_names.index(name) for name in base_names]
-    return columns, base_names
-
-
-def compact_fold_report(
-    fold: dict,
-    selected: dict,
-    index: int,
-    best_iteration: int,
+def _prior_signature_payload(
+    feature_signature: str,
+    split_name: str,
+    train_positions: np.ndarray,
+    valid_positions: np.ndarray,
+    specs: list[tuple[str, float | None]],
+    shrinkage: float,
 ) -> dict:
     return {
-        "fold_id": fold["fold_id"],
-        "base_score": fold["base_score"],
-        "selected_score": selected["fold_scores"][index],
-        "selected_delta": selected["fold_deltas"][index],
-        "entity_best_iteration": int(best_iteration),
-        "diagnostics": fold["diagnostics"],
-    }
-
-
-def existing_full_report(metadata: dict) -> dict:
-    selected = metadata["selected_weight_report"]
-    return {
-        "variant": "full",
-        "description": "categorical asset_id plus causal feature state",
-        "reused_production_result": True,
-        "selected_entity_weight": float(metadata["selected_oof_entity_weight"]),
-        "mean_cv_score": float(selected["mean_fold_score"]),
-        "mean_cv_delta": float(np.mean(selected["fold_deltas"])),
-        "min_cv_delta": float(np.min(selected["fold_deltas"])),
-        "latest_cv_delta": float(selected["fold_deltas"][-1]),
-        "all_cv_deltas_positive": bool(np.all(
-            np.asarray(selected["fold_deltas"]) > 0.0
-        )),
-        "cv_folds": metadata["cv_folds"],
-        "holdout": metadata["holdout"],
+        "schema_version": SCHEMA_VERSION,
+        "production_feature_signature": feature_signature,
+        "split": split_name,
+        "train_positions": [
+            int(train_positions[0]), int(train_positions[-1]),
+            int(len(train_positions)),
+        ],
+        "valid_positions": [
+            int(valid_positions[0]), int(valid_positions[-1]),
+            int(len(valid_positions)),
+        ],
+        "prior_specs": [
+            {"feature": name, "half_life": half_life}
+            for name, half_life in specs
+        ],
+        "prior_shrinkage": shrinkage,
+        "method": "causal_train_then_frozen_validation_v2",
     }
 
 
@@ -410,31 +297,33 @@ def main() -> None:
     source_work_dir = Path(args.source_work_dir)
     work_dir = Path(args.work_dir)
     model_dir = Path(args.model_dir)
-    output_dir = work_dir / "entity_identity_ablation"
+    output_dir = work_dir / "entity_prior_ablation"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata_path = model_dir / "metadata.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata = json.loads(
+        (model_dir / "metadata.json").read_text(encoding="utf-8")
+    )
     if int(metadata.get("schema_version", 0)) != strategy_train.SCHEMA_VERSION:
         raise ValueError("production entity model must use schema_version=2")
     production_config = metadata.get("training_config", {})
-    expected_config = {
-        "entity_rounds": args.entity_rounds,
-        "early_stopping": args.early_stopping,
-    }
     mismatched = {
         key: (production_config.get(key), value)
-        for key, value in expected_config.items()
+        for key, value in {
+            "entity_rounds": args.entity_rounds,
+            "early_stopping": args.early_stopping,
+        }.items()
         if production_config.get(key) != value
     }
     if mismatched:
         raise ValueError(
-            "ablation must use the production training budget; "
+            "prior ablation must use the production training budget; "
             f"metadata/request mismatches: {mismatched}"
         )
+
     source_paths = strategy_train.require_source_artifacts(source_work_dir)
-    feature_stage_path = work_dir / "entity_feature_stage.json"
-    feature_stage = json.loads(feature_stage_path.read_text(encoding="utf-8"))
+    feature_stage = json.loads(
+        (work_dir / "entity_feature_stage.json").read_text(encoding="utf-8")
+    )
     source_stage = json.loads(
         source_paths["feature_stage"].read_text(encoding="utf-8")
     )
@@ -446,10 +335,11 @@ def main() -> None:
     extra_feature_path = work_dir / "extra_cross_z_features.npy"
     entity_label_path = work_dir / "entity_residual_target.npy"
     if not extra_feature_path.exists() or not entity_label_path.exists():
-        raise FileNotFoundError(
-            "missing production feature cache; run train.py first"
-        )
+        raise FileNotFoundError("missing production feature cache; run train.py first")
 
+    source_columns, base_feature_names = identity.source_columns_for_variant(
+        "full", source_names, production_names
+    )
     base_report = json.loads(
         (base_model_dir / "lightgbm_report.json").read_text(encoding="utf-8")
     )
@@ -482,8 +372,8 @@ def main() -> None:
         unique_times, row_offsets, plan.holdout_time_ids
     )
     source_feature_path = source_paths["entity_features"]
-    weight_path = base_cache_dir / cache["weight_file"]
     target_path = base_cache_dir / cache["target_file"]
+    weight_path = base_cache_dir / cache["weight_file"]
     base_prediction_path = source_paths["base_prediction"]
     asset_column = source_names.index("asset_id")
     weights = [
@@ -493,18 +383,20 @@ def main() -> None:
 
     reports = []
     if "full" in variants:
-        reports.append(existing_full_report(metadata))
+        full_report = identity.existing_full_report(metadata)
+        full_report["description"] = "categorical asset_id without residual prior"
+        reports.append(full_report)
         progress("reused full production CV/holdout result")
 
-    for variant in [item for item in variants if item != "full"]:
+    for variant in [name for name in variants if name != "full"]:
+        specs = VARIANT_SPECS[variant]
         variant_dir = output_dir / variant
         variant_dir.mkdir(parents=True, exist_ok=True)
-        source_columns, base_feature_names = source_columns_for_variant(
-            variant, source_names, production_names
-        )
-        feature_names = [*base_feature_names, *extra_names]
-        if variant == "frozen_prior":
-            feature_names.append(FROZEN_PRIOR_NAME)
+        feature_names = [
+            *base_feature_names,
+            *extra_names,
+            *(name for name, _ in specs),
+        ]
         folds = []
         best_iterations = []
         for eval_index in range(1, len(fold_spans)):
@@ -514,49 +406,39 @@ def main() -> None:
             train_positions = np.concatenate(fold_positions[:eval_index])
             valid_spans = fold_spans[eval_index]
             valid_positions = fold_positions[eval_index]
-            train_prior_path = None
-            valid_prior_path = None
-            prior_signature_payload = None
-            if variant == "frozen_prior":
-                prior_signature_payload = {
-                    "schema_version": ABLATION_SCHEMA_VERSION,
-                    "production_feature_signature": feature_stage["signature"],
-                    "split": f"fold{eval_index}",
-                    "train_positions": [
-                        int(train_positions[0]), int(train_positions[-1]),
-                        int(len(train_positions)),
-                    ],
-                    "valid_positions": [
-                        int(valid_positions[0]), int(valid_positions[-1]),
-                        int(len(valid_positions)),
-                    ],
-                    "prior_shrinkage": args.prior_shrinkage,
-                    "method": "causal_train_then_frozen_validation_v1",
-                }
-                train_prior_path, valid_prior_path = ensure_frozen_prior(
-                    variant_dir,
-                    f"fold{eval_index}",
-                    prior_signature_payload,
-                    source_feature_path,
-                    asset_column,
-                    entity_label_path,
-                    train_positions,
-                    valid_positions,
-                    row_offsets,
-                    args.prior_shrinkage,
-                    args.skip_existing_models,
-                )
+            prior_payload = _prior_signature_payload(
+                feature_stage["signature"],
+                f"fold{eval_index}",
+                train_positions,
+                valid_positions,
+                specs,
+                args.prior_shrinkage,
+            )
+            train_prior_path, valid_prior_path = ensure_temporal_priors(
+                variant_dir,
+                f"fold{eval_index}",
+                prior_payload,
+                source_feature_path,
+                asset_column,
+                entity_label_path,
+                train_positions,
+                valid_positions,
+                row_offsets,
+                specs,
+                args.prior_shrinkage,
+                args.skip_existing_models,
+            )
             model_path = variant_dir / f"fold{eval_index}.txt"
             model_meta_path = model_path.with_suffix(".json")
             model_signature_payload = {
-                "schema_version": ABLATION_SCHEMA_VERSION,
+                "schema_version": SCHEMA_VERSION,
                 "production_feature_signature": feature_stage["signature"],
                 "variant": variant,
                 "feature_names": feature_names,
                 "eval_index": eval_index,
                 "rounds": args.entity_rounds,
                 "early_stopping": args.early_stopping,
-                "prior": prior_signature_payload,
+                "prior": prior_payload,
                 "params": strategy_train.entity_params(2026, args.threads),
             }
             model_signature = strategy_train.signature(model_signature_payload)
@@ -571,7 +453,7 @@ def main() -> None:
             if can_load:
                 progress(f"reusing {variant} fold={eval_index}, rounds={rounds}")
             else:
-                train_set = build_dataset(
+                train_set = identity.build_dataset(
                     source_feature_path,
                     source_columns,
                     extra_feature_path,
@@ -581,7 +463,7 @@ def main() -> None:
                     feature_names,
                     train_prior_path,
                 )
-                valid_set = build_dataset(
+                valid_set = identity.build_dataset(
                     source_feature_path,
                     source_columns,
                     extra_feature_path,
@@ -611,7 +493,7 @@ def main() -> None:
                     "best_iteration": rounds,
                 }, indent=2), encoding="utf-8")
                 del train_set, valid_set
-            raw_prediction = predict(
+            raw_prediction = identity.predict(
                 model,
                 source_feature_path,
                 source_columns,
@@ -663,40 +545,29 @@ def main() -> None:
         mean_rounds = max(1, int(round(np.mean(best_iterations))))
         development_spans = [span for group in fold_spans for span in group]
         development_positions = np.concatenate(fold_positions)
-        train_prior_path = None
-        holdout_prior_path = None
-        holdout_prior_signature = None
-        if variant == "frozen_prior":
-            holdout_prior_signature = {
-                "schema_version": ABLATION_SCHEMA_VERSION,
-                "production_feature_signature": feature_stage["signature"],
-                "split": "holdout",
-                "train_positions": [
-                    int(development_positions[0]),
-                    int(development_positions[-1]),
-                    int(len(development_positions)),
-                ],
-                "valid_positions": [
-                    int(holdout_positions[0]), int(holdout_positions[-1]),
-                    int(len(holdout_positions)),
-                ],
-                "prior_shrinkage": args.prior_shrinkage,
-                "method": "causal_train_then_frozen_validation_v1",
-            }
-            train_prior_path, holdout_prior_path = ensure_frozen_prior(
-                variant_dir,
-                "holdout",
-                holdout_prior_signature,
-                source_feature_path,
-                asset_column,
-                entity_label_path,
-                development_positions,
-                holdout_positions,
-                row_offsets,
-                args.prior_shrinkage,
-                args.skip_existing_models,
-            )
-        development_set = build_dataset(
+        holdout_payload = _prior_signature_payload(
+            feature_stage["signature"],
+            "holdout",
+            development_positions,
+            holdout_positions,
+            specs,
+            args.prior_shrinkage,
+        )
+        train_prior_path, holdout_prior_path = ensure_temporal_priors(
+            variant_dir,
+            "holdout",
+            holdout_payload,
+            source_feature_path,
+            asset_column,
+            entity_label_path,
+            development_positions,
+            holdout_positions,
+            row_offsets,
+            specs,
+            args.prior_shrinkage,
+            args.skip_existing_models,
+        )
+        development_set = identity.build_dataset(
             source_feature_path,
             source_columns,
             extra_feature_path,
@@ -714,17 +585,18 @@ def main() -> None:
             args.early_stopping,
             args.threads,
         )
-        raw_holdout = predict(
-            holdout_model,
-            source_feature_path,
-            source_columns,
-            extra_feature_path,
-            holdout_spans,
-            mean_rounds,
-            holdout_prior_path,
-        )
         holdout_prediction = strategy_train.center_entity_by_time(
-            raw_holdout, holdout_positions, row_offsets
+            identity.predict(
+                holdout_model,
+                source_feature_path,
+                source_columns,
+                extra_feature_path,
+                holdout_spans,
+                mean_rounds,
+                holdout_prior_path,
+            ),
+            holdout_positions,
+            row_offsets,
         )
         holdout_target = strategy_train.read_vector_spans(target_path, holdout_spans)
         holdout_weight = strategy_train.read_vector_spans(weight_path, holdout_spans)
@@ -753,11 +625,12 @@ def main() -> None:
         fold_deltas = np.asarray(selected["fold_deltas"], dtype=np.float64)
         report = {
             "variant": variant,
-            "description": (
-                "asset_id removed"
-                if variant == "no_asset_id"
-                else "asset_id replaced by train-only frozen shrunken residual prior"
-            ),
+            "description": "categorical asset_id plus time-safe residual priors",
+            "prior_specs": [
+                {"feature": name, "half_life": half_life}
+                for name, half_life in specs
+            ],
+            "prior_shrinkage": args.prior_shrinkage,
             "reused_production_result": False,
             "feature_count": len(feature_names),
             "selected_entity_weight": beta,
@@ -769,7 +642,9 @@ def main() -> None:
             "all_cv_deltas_positive": bool(np.all(fold_deltas > 0.0)),
             "selected_weight_report": selected,
             "cv_folds": [
-                compact_fold_report(fold, selected, index, best_iterations[index])
+                identity.compact_fold_report(
+                    fold, selected, index, best_iterations[index]
+                )
                 for index, fold in enumerate(folds)
             ],
             "holdout": {
@@ -780,9 +655,6 @@ def main() -> None:
                 "entity_prediction_mean": float(np.mean(holdout_prediction)),
             },
             "feature_importance": str(importance_path.relative_to(output_dir)),
-            "prior_shrinkage": (
-                args.prior_shrinkage if variant == "frozen_prior" else None
-            ),
         }
         (variant_dir / "report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
@@ -797,23 +669,21 @@ def main() -> None:
 
     full = next((item for item in reports if item["variant"] == "full"), None)
     for report in reports:
-        if full is None:
-            report["mean_cv_score_vs_full"] = None
-            report["holdout_score_vs_full"] = None
-        else:
-            report["mean_cv_score_vs_full"] = (
-                report["mean_cv_score"] - full["mean_cv_score"]
-            )
-            report["holdout_score_vs_full"] = (
-                report["holdout"]["entity_score"]
-                - full["holdout"]["entity_score"]
-            )
+        report["mean_cv_score_vs_full"] = (
+            None if full is None
+            else report["mean_cv_score"] - full["mean_cv_score"]
+        )
+        report["holdout_score_vs_full"] = (
+            None if full is None
+            else report["holdout"]["entity_score"]
+            - full["holdout"]["entity_score"]
+        )
     summary = {
-        "schema_version": ABLATION_SCHEMA_VERSION,
-        "experiment": "entity_identity_ablation",
+        "schema_version": SCHEMA_VERSION,
+        "experiment": "entity_prior_ablation",
         "time_safety": (
-            "prior training rows use only earlier time labels; validation and "
-            "holdout use frozen state estimated from their training periods"
+            "training priors use only earlier labels; validation and holdout "
+            "use states frozen at the end of their training periods"
         ),
         "variants": reports,
         "config": {
@@ -852,7 +722,7 @@ def main() -> None:
                 "mean_cv_score_vs_full": report["mean_cv_score_vs_full"],
                 "holdout_score_vs_full": report["holdout_score_vs_full"],
             })
-    progress(f"ablation summary written: {summary_path}")
+    progress(f"prior ablation summary written: {summary_path}")
     print(json.dumps(summary, indent=2))
 
 

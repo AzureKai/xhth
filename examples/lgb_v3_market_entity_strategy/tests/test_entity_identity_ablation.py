@@ -45,6 +45,28 @@ class EntityIdentityAblationTests(unittest.TestCase):
             ])
             np.testing.assert_allclose(sequence[:], expected)
 
+    def test_combined_sequence_accepts_multiple_prior_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = np.arange(12, dtype=np.float32).reshape(4, 3)
+            extra = np.arange(8, dtype=np.float32).reshape(4, 2)
+            priors = np.asarray([
+                [0.1, 1.1], [0.2, 1.2], [0.3, 1.3], [0.4, 1.4],
+            ], dtype=np.float32)
+            np.save(root / "source.npy", source)
+            np.save(root / "extra.npy", extra)
+            np.save(root / "priors.npy", priors)
+            sequence = AblationEntitySequence(
+                root / "source.npy",
+                [0, 2],
+                root / "extra.npy",
+                [(0, 4)],
+                root / "priors.npy",
+            )
+
+            expected = np.column_stack([source[:, [0, 2]], extra, priors])
+            np.testing.assert_allclose(sequence[:], expected)
+
     def test_prior_uses_only_previous_times_and_shrinks_to_zero(self):
         output = np.empty(4, dtype=np.float32)
         sums: dict[int, float] = {}
