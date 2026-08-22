@@ -66,6 +66,9 @@ examples/lgb_v3_market_entity_strategy/submission.csv
 examples/lgb_c4_entity_blend_strategy/work/
 examples/lgb_c4_entity_blend_strategy/model/
 examples/lgb_c4_entity_blend_strategy/submission.csv
+examples/lgb_asset_cluster_residual_strategy/work/
+examples/lgb_asset_cluster_residual_strategy/model/
+examples/lgb_asset_cluster_residual_strategy/submission.csv
 
 # Logs and temporary files
 *.log
